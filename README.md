@@ -1,8 +1,12 @@
 # LightAIBox · Lightweight AI Toolbox
 
+[简体中文](README.zh-CN.md) | English
+
 A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compatible / Anthropic) behind a single local entry point, with smart scheduling, quota control, and call logging. Manage and reuse multiple model keys from one place.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
+
+![LightAIBox main window](homepage.png)
 
 ## Features
 
@@ -12,6 +16,17 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
 - **Call logging & stats** — SQLite-persisted records of tokens, latency, speed, and status per call, filterable by date / provider, with aggregated statistics.
+
+## When to use Auto Mode
+
+The `auto` model (adaptive scheduling) is especially recommended when:
+
+1. **Your model API has a quota limit** — when one provider hits its token
+   limit, LightAIBox automatically switches to the next available one, so your
+   AI coding session never gets interrupted mid-flight.
+2. **You're juggling multiple free/limited accounts** — providers are picked
+   automatically by priority / quota / input length, so you can squeeze the
+   most out of every free token. Cyber-beggar friendly. 🫙
 
 ## Quick Start
 
@@ -67,10 +82,6 @@ app/
 └── ui/              # PySide6 UI
 ```
 
-## Documentation
-
-- 简体中文: [README.zh-CN.md](README.zh-CN.md)
-
 ## Packaging (build a distributable executable)
 
 LightAIBox can be packaged into a standalone executable using PyInstaller. A
@@ -100,4 +111,10 @@ Notes:
 
 ## License
 
-This project is not licensed for redistribution; contact the author for commercial or distribution use.
+This project is released under the [MIT License](LICENSE). You are free to use,
+modify, and distribute it, including for commercial purposes.
+
+## Acknowledgements
+
+Special thanks to **my wife** for the Alibaba Cloud account — one more source of
+free model tokens to scrape by on. 💖

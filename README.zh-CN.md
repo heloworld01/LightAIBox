@@ -1,8 +1,12 @@
 # LightAIBox · 轻量化 AI 工具箱
 
+中文 | [English](README.md)
+
 基于 **PySide6** 的桌面端轻量级 AI 网关工具：把多个大模型 API 提供方（OpenAI 兼容 / Anthropic）统一到一个本地入口，提供调度、配额、调用记录等能力，在本地集中管理并复用多套大模型密钥。
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
+
+![LightAIBox 主界面](homepage.zh-CN.png)
 
 ## 特性
 
@@ -12,6 +16,13 @@
 - **智能调度**：按策略（长输入优先 / 短输入优先）挑选，单 Provider 失败自动降级重试。
 - **配额控制**：按调用次数或 token 数设限，超配额自动停用、可一键重置。
 - **调用记录与统计**：SQLite 持久化，支持按日期 / Provider 过滤并汇总调用次数、成功率与 token 用量。
+
+## 推荐使用自动模式的场景
+
+`auto` 模型（自适应调度）尤其推荐在以下场景使用：
+
+1. **大模型 API 存在限额**：某个 Provider 超出 token 限额后自动切换到下一个可用 Provider，避免 AI 编程中途中断。
+2. **多套免费 / 受限账号轮换**：按优先级 / 限额 / 输入长度自动挑选模型，把每一份免费 token 都榨干用尽，赛博乞丐友好。🫙
 
 ## 快速开始
 
@@ -23,7 +34,7 @@ pip install -r requirements.txt
 python -m app.main
 ```
 
-首次运行自动创建数据库 `app/data/lightbox.db`。
+首次运行自动在用户数据目录创建数据库（Windows 为 `%APPDATA%/LightAIBox/lightbox.db`，Linux 为 `~/.local/share/LightAIBox/`，macOS 为 `~/Library/Application Support/LightAIBox/`）。
 
 ### 添加 Provider
 
@@ -65,10 +76,10 @@ app/
 └── ui/              # PySide6 界面
 ```
 
-## 文档
-
-- English: [README.md](README.md)
-
 ## 许可证
 
-本项目未指定开源许可证，如需商用或分发请与作者确认。
+本项目采用 [MIT 许可证](LICENSE)，可自由使用、修改与分发，含商业用途。
+
+## 特别鸣谢
+
+感谢**老婆大人**提供的阿里云账号，让我能多蹭一份免费的大模型 token。💖
