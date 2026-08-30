@@ -1,0 +1,39 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# === 数据库文件（运行时生成，不提交） ===
+app/data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# === 打包过程 / 结果文件（PyInstaller） ===
+build/
+dist/
+*.spec.bak
+
+# === 自测文件 ===
+selftest_cc.py
+selftest_err.log
+selftest*.log
+
+# === UI 设计文件 ===
+UI_SPEC.md
+
+# === IDE / 编辑器 ===
+.idea/
+.vscode/
+*.iml
+
+# === 本机工具配置 ===
+.claude/
+
+# === 系统文件 ===
+.DS_Store
+Thumbs.db
