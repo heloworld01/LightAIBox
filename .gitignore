@@ -18,6 +18,10 @@ build/
 dist/
 *.spec.bak
 
+# === 发布产物（Release 附件，不进仓库） ===
+release/
+*.zip
+
 # === 自测文件 ===
 selftest_cc.py
 selftest_err.log
