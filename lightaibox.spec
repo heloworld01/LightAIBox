@@ -23,6 +23,8 @@ block_cipher = None
 _PROJECT_DIR = os.path.abspath(".")
 _MANIFEST = os.path.join(_PROJECT_DIR, "app", "resources",
                          "lightaibox.exe.manifest")
+# 打包后 exe 自身的图标（资源管理器 / 任务栏未设置窗口图标时的兜底）
+_ICON = os.path.join(_PROJECT_DIR, "app", "resources", "logo.ico")
 
 # uvicorn 及其 loop 实现、日志依赖使用运行时动态导入，需显式收集。
 hiddenimports = collect_submodules("uvicorn") + \
@@ -79,7 +81,7 @@ exe = EXE(
     console=False,  # 无控制台窗口（GUI 应用）
     disable_windowed_traceback=False,
     manifest=_MANIFEST,  # 嵌入 Per-Monitor DPI 感知 manifest
-    icon=None,
+    icon=_ICON,
 )
 
 coll = COLLECT(

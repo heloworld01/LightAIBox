@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication
 from . import db
 from .gateway import Gateway
 from .server import GatewayServer, ServerConfig
-from .ui.main_window import MainWindow
+from .ui.main_window import MainWindow, _make_tray_icon
 
 
 def _setup_high_dpi() -> None:
@@ -28,8 +28,27 @@ def _setup_high_dpi() -> None:
         Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor)
 
 
+def _setup_app_user_model_id() -> None:
+    """设置任务栏 AppUserModelID，修复 python.exe 身份下的任务栏图标缓存。
+
+    通过 `python -m app.main` 启动时进程名是 python.exe，Windows 任务栏按
+    (exe, AppID) 缓存图标。不设 AppID 时所有 python 进程共享同一个缓存键，
+    早期实例（未设窗口图标）缓存的 python 图标会一直显示，即使新实例的
+    窗口图标已经正确（WM_GETICON 返回 logo，但任务栏仍显示 python）。
+
+    显式设置稳定 AppID 后缓存键唯一，任务栏立即取用窗口图标。
+    """
+    import ctypes
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LightAIBox")
+    except Exception:
+        pass  # 非 Windows / 权限受限时静默跳过
+
+
 def main() -> int:
     _setup_high_dpi()
+    _setup_app_user_model_id()
     db.init_db()
 
     app = QApplication(sys.argv)

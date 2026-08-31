@@ -181,9 +181,11 @@ class MessageBox(QDialog):
         bl.addStretch()
         primaries = {QMessageBox.Ok, QMessageBox.Yes, QMessageBox.Save}
         for b in buttons:
+            # 元组 (StandardButton, "文字")：身份取第一个元素，文字走 _button_text
+            value = b[0] if isinstance(b, tuple) else b
             btn = QPushButton(self._button_text(b))
-            btn.setProperty("class", "primary" if b in primaries else "ghost")
-            btn.clicked.connect(lambda _=False, val=b: self._accept(val))
+            btn.setProperty("class", "primary" if value in primaries else "ghost")
+            btn.clicked.connect(lambda _=False, val=value: self._accept(val))
             bl.addWidget(btn)
         root.addLayout(bl)
 
@@ -211,6 +213,10 @@ class MessageBox(QDialog):
 
     @staticmethod
     def _button_text(b) -> str:
+        # 支持 (StandardButton, "自定义文字") 元组：文字用自定义值，
+        # 按钮身份取元组第一个元素（供调用方区分选择）
+        if isinstance(b, tuple):
+            return b[1]
         mapping = {QMessageBox.Ok: "OK", QMessageBox.Yes: "是/Yes",
                    QMessageBox.No: "否/No", QMessageBox.Cancel: "取消/Cancel"}
         return mapping.get(b, "OK")
