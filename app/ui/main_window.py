@@ -244,11 +244,10 @@ class MainWindow(QMainWindow):
         tray = QSystemTrayIcon(_make_tray_icon(), self)
         tray.setToolTip("LightAIBox")
 
-        # 右键菜单：标题（应用名，中文/英文跟随语言，禁用态仅作展示）
+        # 右键菜单：标题（项目名，中文/英文跟随语言，禁用态仅作展示）
         menu = QMenu()
         self._tray_title_action = menu.addAction(
-            self.lang.tr("LightAIBox · 轻量化 AI 工具箱",
-                         "LightAIBox · Lightweight AI Toolbox"))
+            self.lang.tr("轻量化AI工具箱", "LightAIBox"))
         self._tray_title_action.setEnabled(False)  # 纯展示，不可点击
         menu.addSeparator()
         self._tray_show_action = menu.addAction(
@@ -285,9 +284,12 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _try_quit(self) -> None:
-        """从托盘菜单真正退出：停止服务线程后结束进程。"""
-        if self._server is not None:
-            self._server.stop()
+        """从托盘菜单直接退出程序。
+
+        不做优雅停止等待：统一 API 服务跑在进程内守护线程（daemon=True），
+        进程退出时随进程一并终止，无需 join 等待；直接 quit() 立刻生效，
+        避免「点退出还要等后台服务收尾」的延迟感。
+        """
         QApplication.instance().quit()
 
     def closeEvent(self, event):
@@ -350,11 +352,10 @@ class MainWindow(QMainWindow):
         self._sync_theme_controls()
         self.gateway_page.retranslate()
         self.api_page.retranslate()
-        # 托盘菜单文案跟随语言切换（含置顶的应用名标题）
+        # 托盘菜单文案跟随语言切换（含置顶的项目名标题）
         if self._tray is not None:
             self._tray_title_action.setText(
-                self.lang.tr("LightAIBox · 轻量化 AI 工具箱",
-                             "LightAIBox · Lightweight AI Toolbox"))
+                self.lang.tr("轻量化AI工具箱", "LightAIBox"))
             self._tray_show_action.setText(
                 self.lang.tr("显示窗口", "Show window"))
             self._tray_quit_action.setText(self.lang.tr("退出", "Quit"))
