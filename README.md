@@ -16,6 +16,7 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
 - **Call logging & stats** — SQLite-persisted records of tokens, latency, speed, and status per call, filterable by date / provider, with aggregated statistics.
+- **Runs in the background** — closing the window minimizes it to the system tray while the unified API keeps serving. Single-click the tray icon to show / hide the window; right-click for show / quit.
 
 ## When to use Auto Mode
 

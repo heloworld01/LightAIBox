@@ -140,6 +140,26 @@ class AnthropicClient(BaseClient):
                 base_url = base_url[:-3]
             kwargs["base_url"] = base_url
         self._client = anthropic.Anthropic(**kwargs)
+        self._fix_bearer_auth()
+
+    def _fix_bearer_auth(self) -> None:
+        """把真实 API key 注入 Authorization: Bearer，兼容按 Bearer 鉴权的网关。
+
+        Anthropic Python SDK 默认只把 api_key 放进 `x-api-key` 请求头，而
+        `Authorization` 头填的是占位符 `Bearer 123`。走官方 API 没问题，但接入
+        自建网关（如 deepseek 服务网格 / devmarket 这类同时暴露 OpenAI 与
+        Anthropic 端点的网关）时，对方只认 `Authorization: Bearer <token>`，
+        于是 Anthropic 端点鉴权失败（"Token 不存在"），导致 Claude Code 接入时
+        provider 被自动关闭，而 UI 连通性测试恰好走 OpenAI 路径所以测不出问题
+        （OpenAI SDK 会把完整 key 放进 Bearer）。
+
+        这里通过 `_custom_headers` 覆盖占位符：该字典在 SDK 的 default_headers
+        属性里最后合并，能够覆盖 auth_headers 注入的 `Bearer 123`。若 SDK 后续
+        版本结构调整（无 _custom_headers 属性），则静默跳过，保持向后兼容。
+        """
+        custom = getattr(self._client, "_custom_headers", None)
+        if isinstance(custom, dict):
+            custom["Authorization"] = f"Bearer {self.provider.api_key}"
 
     def chat(self, messages: List[Message], **kwargs) -> ClientResult:
         system_parts, rest = self._split_messages(messages)

@@ -1,6 +1,13 @@
-"""主窗口：QTabWidget 承载各功能页，Tab 栏右上角提供主题切换按钮。"""
+"""主窗口：QTabWidget 承载各功能页，Tab 栏右上角提供主题切换按钮。
+
+支持「关闭 → 隐藏到系统托盘」：关闭按钮/Alt+F4 将窗口隐藏到托盘，
+后台保持运行（统一 API 服务继续可用）；托盘左键点击切换显示/隐藏，
+托盘右键菜单提供「显示窗口 / 退出」。
+"""
+import os
+
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
@@ -14,19 +21,58 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QSplitterHandle,
+    QSystemTrayIcon,
     QTabBar,
     QTabWidget,
     QWidget,
 )
 
+from .. import config
 from ..gateway import Gateway
 from ..server import GatewayServer
 from .api_page import ApiPage
 from .gateway_page import GatewayPage
 from .i18n import LanguageManager
 from .theme_manager import ThemeManager
+
+
+def _make_tray_icon() -> QIcon:
+    """返回项目 logo 图标（圆角版），供托盘 / 窗口复用。
+
+    优先加载资源目录 app/resources/logo.png（源码与打包态都经 config.
+    RESOURCES_DIR 解析，spec 已把该目录随包分发）；缺失或损坏时回退到
+    程序化绘制的占位图标，保证任何环境都有托盘图标可用。
+    """
+    logo_path = os.path.join(config.RESOURCES_DIR, "logo.png")
+    if os.path.exists(logo_path):
+        icon = QIcon(logo_path)
+        if not icon.isNull():
+            return icon
+    # 回退：程序化绘制（不依赖外部文件）
+    size = 64
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    body = QRectF(6, 10, size - 12, size - 20)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#2B6DE0"))
+    p.drawRoundedRect(body, 12, 12)
+    p.setBrush(QColor(255, 255, 255, 60))
+    p.drawRoundedRect(QRectF(body.left() + 4, body.top() + 4,
+                             body.width() - 8, body.height() * 0.18), 6, 6)
+    p.setBrush(QColor("white"))
+    font = QFont()
+    font.setPixelSize(int(size * 0.55))
+    font.setBold(True)
+    p.setFont(font)
+    p.drawText(body, Qt.AlignmentFlag.AlignCenter, "L")
+    p.end()
+    return QIcon(pix)
 
 
 class WindowControlButton(QPushButton):
@@ -99,6 +145,7 @@ class WindowControlButton(QPushButton):
 class MainWindow(QMainWindow):
     def __init__(self, gateway: Gateway, server: GatewayServer):
         super().__init__()
+        self._server = server  # 用于托盘「退出」时优雅停止后台 API 服务
         self.resize(1100, 720)
         self.setMinimumSize(900, 600)
         # 无边框窗口：去除原生标题栏 + 透明背景以支持圆角。
@@ -111,12 +158,21 @@ class MainWindow(QMainWindow):
                             | Qt.WindowMinMaxButtonsHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
+        # 窗口图标（任务栏 / Alt+Tab / 托盘共用圆角 logo）
+        self.setWindowIcon(_make_tray_icon())
+
         # 应用持久化的主题（暗/亮/跟随系统）
         self.theme = ThemeManager()
         self.theme.apply_theme(self.theme.current())
 
         # 语言管理器（中英文切换）
         self.lang = LanguageManager()
+
+        # 系统托盘：关闭 → 隐藏到托盘后台运行，托盘提供显示/退出。
+        # 仅当系统支持托盘（Windows 正常具备）时启用；本机可用即接入。
+        self._tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._setup_tray()
 
         # 圆角背景载体：透明窗口内需一层实色圆角容器
         self._wrap = QWidget()
@@ -173,6 +229,110 @@ class MainWindow(QMainWindow):
         self._drag_offset = None
 
     # ------------------------------------------------------------------ #
+    # 系统托盘：关闭隐藏到托盘、托盘菜单、真正退出
+    # ------------------------------------------------------------------ #
+    def _setup_tray(self) -> None:
+        """创建托盘图标与右键菜单；左键单击切换窗口显示/隐藏。
+
+        菜单结构：
+            LightAIBox（应用名，禁用态，仅展示）
+            ─────────────
+            显示窗口
+            ─────────────
+            退出
+        """
+        tray = QSystemTrayIcon(_make_tray_icon(), self)
+        tray.setToolTip("LightAIBox")
+
+        # 右键菜单：标题（应用名，中文/英文跟随语言，禁用态仅作展示）
+        menu = QMenu()
+        self._tray_title_action = menu.addAction(
+            self.lang.tr("LightAIBox · 轻量化 AI 工具箱",
+                         "LightAIBox · Lightweight AI Toolbox"))
+        self._tray_title_action.setEnabled(False)  # 纯展示，不可点击
+        menu.addSeparator()
+        self._tray_show_action = menu.addAction(
+            self.lang.tr("显示窗口", "Show window"))
+        self._tray_show_action.triggered.connect(self._tray_show_window)
+        menu.addSeparator()
+        self._tray_quit_action = menu.addAction(self.lang.tr("退出", "Quit"))
+        self._tray_quit_action.triggered.connect(self._try_quit)
+        tray.setContextMenu(menu)
+
+        # 左键单击：显示/隐藏切换（右键交给系统弹出上下文菜单）
+        tray.activated.connect(self._on_tray_activated)
+
+        tray.show()
+        self._tray = tray
+
+        # 首次隐藏到托盘时给一条提示气泡，引导用户如何找回窗口
+        self._tray_hint_shown = False
+
+    def _on_tray_activated(self, reason) -> None:
+        """托盘图标被点击：左键（单击）切换显示/隐藏，其余交给系统菜单。"""
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self._tray_show_window()
+
+    def _tray_show_window(self) -> None:
+        """从托盘恢复到前台：显示窗口（必要时还原）并激活。"""
+        self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _try_quit(self) -> None:
+        """从托盘菜单真正退出：停止服务线程后结束进程。"""
+        if self._server is not None:
+            self._server.stop()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event):
+        """关闭按钮 / Alt+F4：弹窗让用户选择「隐藏到托盘」或「退出程序」。
+
+        选隐藏 → 窗口缩到托盘，统一 API 服务继续在后台运行；选退出 → 真正
+        结束进程（停止服务线程）。托盘不可用（极少数环境）时退化为直接退出。
+        """
+        if self._tray is None:
+            super().closeEvent(event)
+            return
+
+        event.ignore()
+        box = QMessageBox(self)
+        box.setWindowTitle(self.lang.tr("退出 LightAIBox", "Exit LightAIBox"))
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(self.lang.tr("关闭后要怎样处理？", "What to do after closing?"))
+        box.setInformativeText(self.lang.tr(
+            "隐藏到托盘：程序继续在后台运行，统一 API 服务保持可用；\n"
+            "退出程序：结束进程并停止后台服务。",
+            "Hide to tray: keep running in the background with the unified API "
+            "still available;\nQuit: terminate the process and stop the service."))
+        # 按钮顺序：隐藏到托盘（默认）在前，退出程序在后
+        hide_btn = box.addButton(
+            self.lang.tr("隐藏到托盘", "Hide to tray"),
+            QMessageBox.ButtonRole.AcceptRole)
+        quit_btn = box.addButton(
+            self.lang.tr("退出程序", "Quit"),
+            QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(hide_btn)
+        box.exec()
+        if box.clickedButton() is hide_btn:
+            self.hide()
+            if not getattr(self, "_tray_hint_shown", False):
+                self._tray_hint_shown = True
+                self._tray.showMessage(
+                    "LightAIBox",
+                    self.lang.tr(
+                        "已最小化到系统托盘，单击托盘图标或右击托盘图标可恢复窗口。",
+                        "Minimized to system tray. Click the tray icon to restore."),
+                    QSystemTrayIcon.MessageIcon.Information, 3000)
+        else:
+            self._try_quit()
+
+    # ------------------------------------------------------------------ #
     # 文本刷新（Click 时统一语言化）
     # ------------------------------------------------------------------ #
     def changeEvent(self, event):
@@ -190,6 +350,14 @@ class MainWindow(QMainWindow):
         self._sync_theme_controls()
         self.gateway_page.retranslate()
         self.api_page.retranslate()
+        # 托盘菜单文案跟随语言切换（含置顶的应用名标题）
+        if self._tray is not None:
+            self._tray_title_action.setText(
+                self.lang.tr("LightAIBox · 轻量化 AI 工具箱",
+                             "LightAIBox · Lightweight AI Toolbox"))
+            self._tray_show_action.setText(
+                self.lang.tr("显示窗口", "Show window"))
+            self._tray_quit_action.setText(self.lang.tr("退出", "Quit"))
 
     # ------------------------------------------------------------------ #
     # 角控件（主题切换 + 语言切换 + 关闭，置于 Tab 栏右上角，与标签同行）
