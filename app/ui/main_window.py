@@ -337,9 +337,13 @@ class MainWindow(QMainWindow):
                  self.lang.tr("退出程序", "Quit")),
             ],
             parent=self,
+            # 点弹窗右上角 ✕（或 Esc）：仅关闭弹窗，不做任何处理
+            close_value=QMessageBox.Cancel,
         )
         dlg.exec()
-        if dlg.result() == QMessageBox.Save:
+        result = dlg.result()
+        # 仅两个按钮的返回值触发动作；✕（Cancel）代表用户取消操作，保持现状
+        if result == QMessageBox.Save:
             self.hide()
             self._tray_show_icon()
             if not getattr(self, "_tray_hint_shown", False):
@@ -350,7 +354,7 @@ class MainWindow(QMainWindow):
                         "已最小化到系统托盘，单击托盘图标或右击托盘图标可恢复窗口。",
                         "Minimized to system tray. Click the tray icon to restore."),
                     QSystemTrayIcon.MessageIcon.Information, 3000)
-        else:
+        elif result == QMessageBox.Discard:
             self._try_quit()
 
     # ------------------------------------------------------------------ #

@@ -123,12 +123,15 @@ class MessageBox(QDialog):
     提供 information / warning / question 三个静态方法（question 返回 Yes/No）。
     """
 
-    def __init__(self, icon, title: str, text: str, buttons, parent=None):
+    def __init__(self, icon, title: str, text: str, buttons,
+                 parent=None, close_value=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self._result = None
-        self._close_value = QMessageBox.Ok
+        # 点右上角 ✕ 时返回的值：调用方可传 QMessageBox.Cancel 等哨兵值，
+        # 表示「仅关闭弹窗、不执行任何动作」（默认 Ok，沿用 QMessageBox 语义）
+        self._close_value = close_value if close_value is not None else QMessageBox.Ok
         self.setMinimumWidth(420)
 
         # 圆角背景载体
