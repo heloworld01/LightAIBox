@@ -143,10 +143,34 @@ class MainWindow(QMainWindow):
         self._drag_offset: QPoint | None = None
         self._dragging = False
         self._resizing_cursor = False
+        # 记录窗口当前所在屏的 DPR，用于仅在实际跨到不同缩放屏幕时重置拖动。
+        self._last_dpr = self._current_dpr()
         # 边缘悬停需子控件开启鼠标跟踪，才能收到无按键的 MouseMove 事件
         for _w in [self._wrap] + self._wrap.findChildren(QWidget):
             _w.setMouseTracking(True)
         QApplication.instance().installEventFilter(self)
+
+    def _current_dpr(self) -> float:
+        """返回窗口当前所在屏幕的设备像素比（无原生句柄时回退 1.0）。"""
+        wh = self.windowHandle()
+        if wh is None or wh.screen() is None:
+            return 1.0
+        return wh.screen().devicePixelRatio()
+
+    def _on_screen_changed(self):
+        """仅在窗口实际跨到「不同缩放比例」的显示器时，重置拖动偏移。
+
+        QEvent.ScreenChangeInternal 在窗口每次 move() 时都可能触发，若不加
+        区分地清空偏移，会导致同一屏内拖动时窗口「跳一下」甚至被反复重算
+        尺寸而变大。这里用目标屏 DPR 是否变化来过滤：DPR 未变则不动作。
+        """
+        new_dpr = self._current_dpr()
+        if abs(new_dpr - self._last_dpr) < 1e-6:
+            return
+        self._last_dpr = new_dpr
+        # 跨屏瞬间旧偏移基于旧屏坐标基准，已失效，直接丢弃；下次按下重新计算。
+        self._dragging = False
+        self._drag_offset = None
 
     # ------------------------------------------------------------------ #
     # 文本刷新（Click 时统一语言化）
@@ -382,6 +406,12 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         et = event.type()
+        # 跨屏 DPI 突变：窗口被移动到另一台不同缩放比例的显示器时触发。
+        # 在这里重置拖动状态，而非依赖 windowHandle().screenChanged，
+        # 因为 windowHandle() 在窗口 show() 之前为 None，无法提前连接信号。
+        if et == QEvent.Type.ScreenChangeInternal:
+            self._on_screen_changed()
+            return super().eventFilter(obj, event)
         if et == QEvent.Type.MouseButtonDblClick:
             # 双击自定义标题栏（Tab 栏空白 / 顶部留白）切换最大化 / 还原
             if (event.button() == Qt.LeftButton
@@ -399,12 +429,21 @@ class MainWindow(QMainWindow):
                         return True
                 # 否则：非交互空白处拖动整窗
                 if self._is_drag_target(pos):
-                    self._drag_offset = pos - self.frameGeometry().topLeft()
+                    # 偏移基于窗口「逻辑位置」（windowHandle().position()），
+                    # 而非 frameGeometry().topLeft()：后者会被系统按窗口所在屏
+                    # DPI 虚拟化，跨屏时二者坐标基准不一致，偏移会携带 DPR
+                    # 误差 → 拖动瞬间窗口跳动。
+                    win_pos = self.windowHandle().position() \
+                        if self.windowHandle() is not None else self.pos()
+                    self._drag_offset = pos - win_pos
                     self._dragging = True
                     return True
         elif et == QEvent.Type.MouseMove:
             if self._dragging:
                 if event.buttons() & Qt.LeftButton:
+                    # 用整型逻辑坐标移动（Qt 绑定对 QWidget.move/QWindow.
+                    # setPosition 都只暴露整型重载，浮点精度在此不可用）。
+                    # 关键在偏移已按同一逻辑坐标基准计算，跨屏 DPI 不会错位。
                     self.move(event.globalPosition().toPoint() - self._drag_offset)
                 else:
                     self._dragging = False

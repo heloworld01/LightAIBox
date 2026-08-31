@@ -18,6 +18,12 @@ from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
+# Per-Monitor DPI 感知 manifest：Windows 跨不同缩放比例屏幕拖拽窗口时，
+# 告诉系统按「每个显示器自己的 DPI」处理，避免窗口尺寸异常放大。
+_PROJECT_DIR = os.path.abspath(".")
+_MANIFEST = os.path.join(_PROJECT_DIR, "app", "resources",
+                         "lightaibox.exe.manifest")
+
 # uvicorn 及其 loop 实现、日志依赖使用运行时动态导入，需显式收集。
 hiddenimports = collect_submodules("uvicorn") + \
                 collect_submodules("uvicorn.loops") + \
@@ -72,6 +78,7 @@ exe = EXE(
     upx=False,
     console=False,  # 无控制台窗口（GUI 应用）
     disable_windowed_traceback=False,
+    manifest=_MANIFEST,  # 嵌入 Per-Monitor DPI 感知 manifest
     icon=None,
 )
 
