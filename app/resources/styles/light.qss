@@ -300,6 +300,36 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: transparent;
 }
 
+/* === QMenu（托盘右键菜单：打开 AI工具箱 / 退出） === */
+QMenu {
+    background: #FFFFFF;
+    color: #1A1F2E;
+    border: 1px solid #E2E5EB;
+    border-radius: 8px;
+    padding: 6px;
+}
+QMenu::item {
+    background: transparent;
+    color: #1A1F2E;
+    padding: 7px 32px 7px 14px;
+    border-radius: 5px;
+    font-size: 13px;
+}
+/* 悬停：背景高亮 + 阴影（同一像素区） */
+QMenu::item:selected {
+    color: #FFFFFF;
+    background: #4F46E5;
+    border-radius: 5px;
+}
+QMenu::item:selected:hover {
+    background: #6366F1;
+}
+QMenu::separator {
+    height: 1px;
+    background: #E2E5EB;
+    margin: 5px 8px;
+}
+
 /* === QToolTip === */
 QToolTip {
     background: #F1F3F8;

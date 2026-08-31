@@ -243,9 +243,7 @@ class MainWindow(QMainWindow):
         """创建托盘图标与右键菜单；左键单击切换窗口显示/隐藏。
 
         菜单结构：
-            LightAIBox（应用名，禁用态，仅展示）
-            ─────────────
-            显示窗口
+            打开 AI工具箱
             ─────────────
             退出
 
@@ -255,14 +253,10 @@ class MainWindow(QMainWindow):
         tray = QSystemTrayIcon(_make_tray_icon(), self)
         tray.setToolTip("LightAIBox")
 
-        # 右键菜单：标题（项目名，中文/英文跟随语言，禁用态仅作展示）
+        # 右键菜单：仅两项——「打开 AI工具箱」（恢复窗口）与「退出」
         menu = QMenu()
-        self._tray_title_action = menu.addAction(
-            self.lang.tr("轻量化AI工具箱", "LightAIBox"))
-        self._tray_title_action.setEnabled(False)  # 纯展示，不可点击
-        menu.addSeparator()
         self._tray_show_action = menu.addAction(
-            self.lang.tr("显示窗口", "Show window"))
+            self.lang.tr("打开 AI工具箱", "Open AI Toolbox"))
         self._tray_show_action.triggered.connect(self._tray_show_window)
         menu.addSeparator()
         self._tray_quit_action = menu.addAction(self.lang.tr("退出", "Quit"))
@@ -375,12 +369,10 @@ class MainWindow(QMainWindow):
         self._sync_theme_controls()
         self.gateway_page.retranslate()
         self.api_page.retranslate()
-        # 托盘菜单文案跟随语言切换（含置顶的项目名标题）
+        # 托盘菜单文案跟随语言切换
         if self._tray is not None:
-            self._tray_title_action.setText(
-                self.lang.tr("轻量化AI工具箱", "LightAIBox"))
             self._tray_show_action.setText(
-                self.lang.tr("显示窗口", "Show window"))
+                self.lang.tr("打开 AI工具箱", "Open AI Toolbox"))
             self._tray_quit_action.setText(self.lang.tr("退出", "Quit"))
 
     # ------------------------------------------------------------------ #
