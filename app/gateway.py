@@ -71,14 +71,23 @@ class Gateway:
 
     def _candidates(self, messages: List[Message],
                     model: Optional[str] = None,
-                    api_type: Optional[str] = None) -> List[Provider]:
+                    api_type: Optional[str] = None,
+                    provider_id: Optional[int] = None) -> List[Provider]:
         """按当前策略对可用 provider 排序，返回有序候选列表（用于逐个重试）。
 
         指定 model 时，进一步只保留模型名匹配的 provider；匹配不到则抛错。
+        指定 provider_id 时，直接锁定该 provider（精确选择，跳过调度）。
         指定 api_type 时，只保留该协议的 provider（统一 API 按调用协议适配）。
         """
         prompt_len = sum(len(str(m.get("content", ""))) for m in messages)
         pool = [p for p in self.providers.list() if p.is_available()]
+        if provider_id is not None:
+            # 精确按 provider 指定：不受调度策略 / 输入门槛影响，仅要求可用
+            matched = [p for p in pool if p.id == provider_id]
+            if not matched:
+                raise GatewayError(
+                    f"指定的 provider「{provider_id}」不存在、已停用或超出配额")
+            return matched
         if api_type:
             # 限协议类型：匹配该协议或兼容型（兼容型可用于任一协议）
             pool = [p for p in pool
@@ -100,10 +109,13 @@ class Gateway:
 
     def pick_provider(self, messages: List[Message],
                       model: Optional[str] = None,
-                      api_type: Optional[str] = None) -> Optional[Provider]:
-        """返回按策略排序后第一个可用 provider（可限定模型名与协议类型）。"""
+                      api_type: Optional[str] = None,
+                      provider_id: Optional[int] = None) -> Optional[Provider]:
+        """返回按策略排序后第一个可用 provider（可限定模型名 / 协议类型 / 直接指定）。"""
         try:
-            return self._candidates(messages, model=model, api_type=api_type)[0]
+            return self._candidates(
+                messages, model=model, api_type=api_type,
+                provider_id=provider_id)[0]
         except GatewayError:
             return None
 
@@ -151,17 +163,20 @@ class Gateway:
     # ------------------------------------------------------------------ #
     def chat(self, messages: List[Message], policy: Optional[str] = None,
              model: Optional[str] = None, api_type: Optional[str] = None,
+             provider_id: Optional[int] = None,
              **kwargs) -> ClientResult:
         """统一调用入口（一次性返回）。
 
         指定 `model` 时按模型名挑选 provider，否则按策略在全部可用 provider 中
-        自适应挑选。`api_type` 可限定只在该协议类型的 provider 中挑选（统一 API
+        自适应挑选。`provider_id` 可精确指定某个 provider（跳过调度）。
+        `api_type` 可限定只在该协议类型的 provider 中挑选（统一 API
         按调用协议适配）。policy 缺省时保持上一次策略（默认长输入优先）；每次调用
         重新从 DB 读 provider 列表，保证配额/启用状态被及时反映。全部 provider
         失败抛 GatewayError。
         """
         self.policy = policy or self.policy
-        candidates = self._candidates(messages, model=model, api_type=api_type)
+        candidates = self._candidates(
+            messages, model=model, api_type=api_type, provider_id=provider_id)
 
         last_err: Optional[ChatError] = None
         for p in candidates:
@@ -189,16 +204,18 @@ class Gateway:
     def chat_stream(self, messages: List[Message], policy: Optional[str] = None,
                     model: Optional[str] = None,
                     api_type: Optional[str] = None,
+                    provider_id: Optional[int] = None,
                     **kwargs) -> Generator[str, None, ClientResult]:
         """统一调用入口（流式）。
 
-        指定 `model` 时按模型名挑选 provider，否则按策略自适应。`api_type` 可
-        限定只在该协议类型的 provider 中挑选。逐段 yield 文本增量；正常结束后
-        回收 ClientResult（含 token 速度）。若首选的 provider 在流式过程中失败，
-        同样降级到下一个候选重试。
+        指定 `model` 时按模型名挑选 provider，否则按策略自适应。`provider_id`
+        可精确指定某个 provider。`api_type` 可限定只在该协议类型的 provider 中
+        挑选。逐段 yield 文本增量；正常结束后回收 ClientResult（含 token 速度）。
+        若首选的 provider 在流式过程中失败，同样降级到下一个候选重试。
         """
         self.policy = policy or self.policy
-        candidates = self._candidates(messages, model=model, api_type=api_type)
+        candidates = self._candidates(
+            messages, model=model, api_type=api_type, provider_id=provider_id)
 
         last_err: Optional[ChatError] = None
         for p in candidates:

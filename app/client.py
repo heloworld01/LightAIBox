@@ -100,6 +100,7 @@ class OpenAIClient(BaseClient):
             model=self.provider.model,
             messages=messages,
             stream=True,
+            stream_options={"include_usage": True},
             **kwargs,
         )
         chunks: List[str] = []

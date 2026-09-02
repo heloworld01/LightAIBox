@@ -18,6 +18,13 @@ build/
 dist/
 *.spec.bak
 
+# === 代码签名证书（含私钥，严禁提交） ===
+cert/
+*.pfx
+*.p12
+*.key
+*.crt
+
 # === 发布产物（Release 附件，不进仓库） ===
 release/
 *.zip

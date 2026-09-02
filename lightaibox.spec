@@ -30,7 +30,8 @@ _ICON = os.path.join(_PROJECT_DIR, "app", "resources", "logo.ico")
 hiddenimports = collect_submodules("uvicorn") + \
                 collect_submodules("uvicorn.loops") + \
                 collect_submodules("uvicorn.protocols") + \
-                collect_submodules("fastapi") + [
+                collect_submodules("fastapi") + \
+                collect_submodules("markdown") + [
                     "anyio",
                     "anyio._backends",
                     "anyio._backends._asyncio",

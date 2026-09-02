@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  对话页的内嵌渲染容器（QWebEngineView 加载）。
+
+  职责：
+    1. 提供 #messages 容器，Python 端把「气泡 HTML」整体注入（innerHTML 替换）。
+    2. 加载本地打包的 MathJax v3（tex-chtml，随 app/resources 分发，离线可用）。
+    3. 暴露 window.__renderChat(html, pageBg)：
+       设消息 HTML + 页面底色 -> MathJax 重排公式 -> 滚到底部。
+
+  配色均由 Python 端经 _chat_palette() 内联注入到气泡；此处仅设基础版式与
+  MathJax 配置。点击 #messages 内 a[href^="chat:"] 阻止默认跳转（由 Python 端
+  QWebEnginePage.acceptNavigationRequest 拦截处理）。
+-->
+<style>
+  /* 透明打底：WebView 原生窗口背景透出作为「未上色前」的底色（配合 Python
+     侧 setBackgroundColor 消除首帧白闪）。上色后由下方 html{min-height} 实色
+     覆盖，不会露出原生色。绝不能在这里写死某个主题的实色——否则切换主题时
+     body 被 JS 涂成新主题色，而硬编码色会把另一层留成旧主题色，出现上下分色。 */
+  html, body {
+    margin: 0;
+    padding: 8px;
+    box-sizing: border-box;
+    background-color: transparent;
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  /* 让 html 始终铺满整个滚动区（含内容溢出后的视口以下部分），并用 --page-bg
+     实色绘制。body 高度只包住内容，若仅给 body 上色，溢出视口的下半截会露出
+     原生背景色（暗），导致亮色主题下「上亮下暗」的分界。html 有实色背景时会
+     propagate 到 canvas，使整页（含溢出区）都是同一主题色。--page-bg 由
+     __renderChat 注入，默认回退暗色，保证首帧即便 JS 未及时跑也不是纯白。 */
+  html {
+    min-height: 100%;
+    background-color: var(--page-bg, #161B26);
+  }
+  /* #messages 直接承载 Python 端生成的富文本气泡 */
+  mjx-container {
+    line-height: normal;
+  }
+</style>
+<script>
+  // MathJax v3 初始化配置必须在加载 tex-chtml.js 之前生效
+  window.MathJax = {
+    tex: {
+      inlineMath: [['\\(', '\\)'], ['$', '$']],
+      displayMath: [['\\[', '\\]'], ['$$', '$$']],
+      processEscapes: true,
+      packages: ['base', 'ams', 'autoload', 'newcommand',
+                 'configmacros', 'require', 'color']
+    },
+    options: {
+      // 代码块 / 原文标签内的文字不当作公式扫描
+      skipHtmlTags: ['script', 'noscript', 'style', 'textarea',
+                     'pre', 'code', 'annotation', 'annotation-xml'],
+      processHtmlClass: 'tex2jax_process',
+      ignoreHtmlClass: 'no-mathjax'
+    },
+    chtml: {
+      scale: 1.0
+    }
+  };
+</script>
+<script src="vendor/mathjax/tex-chtml.js" id="MathJax-script" async></script>
+<script>
+  // MathJax 尚未就绪时的会话内排队：先注入 HTML，等 MathJax ready 后再重排。
+  window.__mathJaxReady = new Promise(function (resolve) {
+    window.__resolveMathJaxReady = resolve;
+  });
+  document.addEventListener('DOMContentLoaded', function () {
+    var check = setInterval(function () {
+      if (window.MathJax && window.MathJax.typesetPromise) {
+        clearInterval(check);
+        window.__resolveMathJaxReady();
+      }
+    }, 30);
+  });
+
+  function _scrollBottom() {
+    window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  // 供 Python 端调用：整体替换消息区 HTML 并让 MathJax 重排
+  window.__renderChat = function (html, pageBg) {
+    var el = document.getElementById('messages');
+    // 用 CSS 变量驱动 html 实色背景（见上方 html{min-height} 规则），使整页
+    // 含溢出视口的下半截都涂成当前主题色；同时设 body 兜底旧版/异常路径。
+    if (pageBg) {
+      document.documentElement.style.setProperty('--page-bg', pageBg);
+      document.body.style.backgroundColor = pageBg;
+    }
+    el.innerHTML = html;
+    _scrollBottom();
+    window.__mathJaxReady.then(function () {
+      try {
+        MathJax.typesetPromise([el]).then(_scrollBottom).catch(_scrollBottom);
+      } catch (e) { _scrollBottom(); }
+    });
+  };
+
+  // 「原文/渲染」切换链接拦截。
+  //
+  // QWebEngine 对自定义 scheme（chat:）的链接点击不会发起导航，因此
+  // acceptNavigationRequest 收不到它；改 fragment 又属同文档导航也不经过它。
+  // 这里在点击时 preventDefault，并把动作重写为「本页 file URL + ?__lightaibox__=<action>」
+  // 的脚本化跨文档导航——file scheme 的导航才会可靠地经 acceptNavigationRequest
+  // 送回到 Python 侧处理（返回 False 即阻断，页面不会真的跳转）。
+  // 详见 chat_page.py 的 _ChatPage。
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    while (t && t !== document && !(t.getAttribute && t.getAttribute('href'))) {
+      t = t.parentNode;
+    }
+    if (!t || !t.getAttribute) return;
+    var href = t.getAttribute('href');
+    if (typeof href !== 'string' || href.indexOf('chat:') !== 0) return;
+    e.preventDefault();
+    var action = href.slice('chat:'.length);          // raw:<idx> / md:<idx>
+    var base = location.href.split('?')[0];           // 保留本页 file 路径（去 query）
+    location.href = base + '?__lightaibox__=' + action;
+  });
+</script>
+</head>
+<body>
+<div id="messages"></div>
+</body>
+</html>

@@ -30,11 +30,13 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QWidget,
 )
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from .. import config
 from ..gateway import Gateway
 from ..server import GatewayServer
 from .api_page import ApiPage
+from .chat_page import ChatPage
 from .gateway_page import GatewayPage
 from .i18n import LanguageManager
 from .theme_manager import ThemeManager
@@ -196,6 +198,9 @@ class MainWindow(QMainWindow):
         self.api_page = ApiPage(gateway, server)
         self.tabs.addTab(self.api_page, self.lang.tr("统一 API", "Unified API"))
 
+        self.chat_page = ChatPage(gateway)
+        self.tabs.addTab(self.chat_page, self.lang.tr("对话", "Chat"))
+
         self._build_controls()
         self._retranslate()
 
@@ -302,10 +307,12 @@ class MainWindow(QMainWindow):
     def _try_quit(self) -> None:
         """从托盘菜单直接退出程序。
 
-        不做优雅停止等待：统一 API 服务跑在进程内守护线程（daemon=True），
-        进程退出时随进程一并终止，无需 join 等待；直接 quit() 立刻生效，
-        避免「点退出还要等后台服务收尾」的延迟感。
+        统一 API 服务跑在进程内守护线程（daemon=True），进程退出时随进程一并
+        终止，无需 join 等待。但聊天生成线程是 QThread：直接退出会把仍在运行
+        的 QThread 就地销毁，触发 "QThread: Destroyed while thread is still
+        running" 而崩溃，故先 shutdown() 收尾，再 quit()。
         """
+        self.chat_page.shutdown()
         QApplication.instance().quit()
 
     def closeEvent(self, event):
@@ -316,6 +323,7 @@ class MainWindow(QMainWindow):
         选退出 → 真正结束进程。托盘不可用（极少数环境）时退化为直接退出。
         """
         if self._tray is None:
+            self.chat_page.shutdown()
             super().closeEvent(event)
             return
 
@@ -366,9 +374,11 @@ class MainWindow(QMainWindow):
                                          "LightAIBox · Lightweight AI Toolbox"))
         self.tabs.setTabText(0, self.lang.tr("AI 网关", "AI Gateway"))
         self.tabs.setTabText(1, self.lang.tr("统一 API", "Unified API"))
+        self.tabs.setTabText(2, self.lang.tr("对话", "Chat"))
         self._sync_theme_controls()
         self.gateway_page.retranslate()
         self.api_page.retranslate()
+        self.chat_page.retranslate()
         # 托盘菜单文案跟随语言切换
         if self._tray is not None:
             self._tray_show_action.setText(
@@ -452,6 +462,12 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_theme(self):
         self.theme.toggle()
+        # 对话区颜色靠 runJavaScript(__renderChat) 跨进程注入并重绘，比 Qt 原生换 QSS
+        # 慢一帧。故在 toggle 后立刻发起这两步，让 JS 注入与 gateway/api 的 retranslate
+        # 尽量并行、尽早抵达 Chromium，收窄「外圈已变色 / 中间气泡慢半拍」的时间差。
+        # 顺序不变：先同步 WebView 视图级底色，再重放气泡（retranslate 内含 _reset_history_view）。
+        self.chat_page.apply_theme_colors()
+        self.chat_page.retranslate()
         self.gateway_page.retranslate()
         self.api_page.retranslate()
         self._sync_theme_controls()
@@ -476,6 +492,9 @@ class MainWindow(QMainWindow):
         QAbstractScrollArea,    # 滚动区 / 文本区
         QLineEdit,
         QAbstractSlider,        # 滑块
+        # 聊天区 WebView：必须支持鼠标拖选复制与链接点击（含「原文/渲染」切换），
+        # 不可把它当作窗口拖动区，否则按下即被吞掉、无法选中文本也无法点链接
+        QWebEngineView,
     )
 
     def _is_drag_target(self, global_pos: QPoint) -> bool:

@@ -526,3 +526,25 @@ QGroupBox::title {
     padding: 0 6px;
     color: #1A1F2E;
 }
+/* === 对话页 === */
+QTextEdit#chatView {
+    background: #FFFFFF;
+    border: 1px solid #E2E5EB;
+    border-radius: 8px;
+    color: #1A1F2E;
+    font-size: 13px;
+    padding: 12px;
+}
+QTextEdit#chatInput {
+    background: #FFFFFF;
+    border: 1px solid #E2E5EB;
+    border-radius: 6px;
+    color: #1A1F2E;
+    padding: 8px 10px;
+}
+QTextEdit#chatInput:focus {
+    border-color: #4F46E5;
+}
+QTextEdit#chatInput::placeholder {
+    color: #9BA3B5;
+}
