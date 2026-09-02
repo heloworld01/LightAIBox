@@ -12,11 +12,12 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 
 - **Unified API proxy** — a single `chat` / `chat_stream` interface hides the OpenAI / Anthropic protocol differences. Call a specific model, or leave it unset to auto-select a provider by policy.
 - **Claude Code ready** — the Anthropic-compatible endpoint fully passes through `tools` and multi-turn `tool_result`, with spec-compliant streaming `tool_use` events, so it can drive Claude Code's multi-step agent loop directly.
-- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX, a per-reply **Raw / Render** toggle, and time separators (see [Built-in Chat](#built-in-chat)).
+- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, and time separators (see [Built-in Chat](#built-in-chat)).
 - **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model), with background connectivity testing that never blocks the UI.
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
 - **Call logging & stats** — SQLite-persisted records of tokens, latency, speed, and status per call, filterable by date / provider, with aggregated statistics.
+- **Floating Provider bar** — an independent, always-on-top, translucent panel floating at the bottom of the screen that lists every running provider and its remaining quota at a glance. It stays visible even when the main window is minimized to the tray; drag it anywhere, or click the lock button to stop it moving. Toggled from the corner of the tab bar (state remembered across restarts).
 - **Runs in the background** — closing the window minimizes it to the system tray while the unified API keeps serving. Single-click the tray icon to show / hide the window; right-click for show / quit.
 
 ## When to use Auto Mode
@@ -80,14 +81,20 @@ same gateway, so it works with any configured provider (or `auto` scheduling):
   radii, and centered time separators (shown for the first message and whenever two
   messages are more than 5 minutes apart).
 - **Real-time streaming** — replies stream into a live bubble as tokens arrive; a **Stop**
-  button cancels the current generation.
+  button cancels the current generation. **Smart scrolling**: while streaming, the view only
+  auto-follows the bottom if you're already at the bottom — if you scroll up to read earlier
+  content it stays put instead of being yanked back down by each token.
 - **Markdown + LaTeX** — replies are rendered from Markdown, and LaTeX is typeset by the
   **locally bundled MathJax v3** (fully offline) using `\(...\)` / `\[...\]` (also
   `$...$` / `$$...$$`). Fenced blocks declared as `latex` / `tex` / `math` are rendered as
-  display math; other code fences stay styled code blocks.
+  centered display math (`%` comments stripped); other code fences stay styled code blocks.
+- **Mermaid diagrams** — ` ```mermaid ` fences are rendered into SVG by the **locally
+  bundled mermaid v10** (fully offline), themed to match the current dark / light UI.
 - **Raw / Render toggle** — a link under each assistant reply flips it between the raw
   Markdown and the rendered view.
-- **Theme-aware** — bubble / avatar / time colors follow the dark / light theme.
+- **Theme-aware** — bubble / avatar / time colors follow the dark / light theme; the chat
+  canvas is transparent so theme switches apply instantly with no one-frame lag, and a thin
+  (6px) scrollbar keeps it unobtrusive.
 
 ## Project Structure
 
@@ -103,7 +110,8 @@ app/
 ├── chat_session.py  # chat session: multi-turn history + display timestamps
 └── ui/              # PySide6 UI
     ├── chat_page.py # Chat tab: WeChat-style bubbles + MathJax rendering
-    └── resources/chat/  # chat container HTML + bundled MathJax v3 (offline)
+    ├── providers_bar.py # floating always-on-top panel: running providers + quota
+    └── resources/chat/  # chat container HTML + bundled MathJax v3 + mermaid (offline)
 ```
 
 ## Packaging (build a distributable executable)

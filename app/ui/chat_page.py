@@ -20,7 +20,7 @@ from datetime import datetime as _datetime
 import markdown as _md
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QFont
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
@@ -56,7 +56,7 @@ def _chat_palette():
             "page_bg": "#FFFFFF",
             "user_bubble": "#EEF2FF",       # 浅主色底
             "user_text": "#312E81",
-            "assistant_bubble": "#F5F6F8",  # 浅灰底
+            "assistant_bubble": "#E9EBEF",  # 浅灰底（略深，与白页拉开对比）
             "assistant_text": "#1A1F2E",
             "user_avatar": "#6366F1",
             "user_avatar_text": "#FFFFFF",
@@ -260,10 +260,10 @@ class ChatPage(QWidget):
         chat_settings.setAttribute(
             QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
         self.view.setPage(_ChatPage(self, self.view))
-        # 关键：setUrl 之前先把 Chromium 视图级底色设成当前主题 page_bg。
-        # QWebEngineView 在首次可见时才创建渲染主机并提交首帧；若此时仍用默认
-        # 白底，切到「对话」Tab 的瞬间会先闪一下白、等 JS 上色后才回主题色。
-        # 视图级背景由合成器直接铺底，早于任何 DOM/CSS，首帧即主题色。
+        # 对话页整体透明：Chromium 视图级底色设为 Qt.transparent，让页面透出底下
+        # 跟随 QSS 的父容器/窗口底色。切主题时外层换 QSS 即时生效，WebView 同步显新
+        # 底色，不再有「中间区滞后一帧 / 上下分色」。必须在 setUrl 前设置，使首帧
+        # 即为透明（否则渲染主机会先按默认白底提交一帧）。
         self.apply_theme_colors()
         # 页面加载完成（脚本 / MathJax 就绪）后再注入首屏内容，见 _on_page_loaded
         self.view.loadFinished.connect(self._on_page_loaded)
@@ -272,6 +272,8 @@ class ChatPage(QWidget):
 
         # 流式刷盘合并：生成期间不要每个 token 都让 MathJax 全量重排
         self._pending_html: str | None = None
+        self._pending_stick: bool = True
+        self._pending_force_pin: bool = False
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
         self._flush_timer.setInterval(120)
@@ -376,13 +378,41 @@ class ChatPage(QWidget):
             "", body, flags=_re.IGNORECASE)
 
         # 代码围栏里显式声明 latex/tex/math 的块当作「渲染公式」而非代码：
-        # 去掉 <pre><code>（MathJax 的 skipHtmlTags 会跳过它们），解 HTML 转义后
-        # 用 \[...\] 显式定界，交给 MathJax 排版成居中式 display math。
+        # 去掉 <pre><code>（MathJax 的 skipHtmlTags 会跳过它们），剥离 % 注释行后
+        # 交给 MathJax 渲染成居中式公式。
+        #   1) 内容自带定界符（$ $、\( \)、\[ \]、$$）：不再外包一层 \[...\]（否则
+        #      MathJax 会在数学模式里撞到 \[ 报 "Undefined control sequence \["），
+        #      直接把转义后的内容放进居中 div，由 MathJax 扫描其自带的定界符渲染。
+        #   2) 否则为「裸公式体」：剥注释、清空行后用 \[...\] 显式定界排版成 display
+        #      math（多行公式之间不留空行，避免 MathJax 报 Blank Line）。
+        # 注入内容一律 HTML 转义：公式里的 < > & 会被浏览器回解为文本、MathJax 仍能
+        # 识别，同时不会把它们当标签解析，杜绝注入。
+        def _render_latex_block(raw):
+            lines = [_re.sub(r'(?<!\\)%.*$', '', ln) for ln in raw.splitlines()]
+            cleaned = '\n'.join(ln for ln in lines if ln.strip()).strip()
+            if not cleaned:
+                return ''
+            stem = _html.escape(cleaned)
+            if _re.search(r'\\(?:\(|\)|\[|\])|\$', cleaned):
+                # 自带定界符：不外包，直接渲染
+                return ('<div style="text-align:center;margin:8px 0;">'
+                        + stem + '</div>')
+            return ('<div style="text-align:center;margin:8px 0;">\\['
+                    + stem + '\\]</div>')
+
         body = _re.sub(
             r'<pre><code class="language-(?:latex|tex|math)">(.*?)</code></pre>',
-            lambda m: ('<div style="text-align:center;margin:8px 0;">\\['
-                       + _html.unescape(m.group(1)).strip()
-                       + '\\]</div>'),
+            lambda m: _render_latex_block(_html.unescape(m.group(1))),
+            body, flags=_re.IGNORECASE | _re.DOTALL)
+
+        # mermaid 围栏：包成 <pre class="mermaid">(内容保持 HTML 转义)，由前端
+        # mermaid.run 读 textContent 渲染成 SVG。必须赶在下方通用代码块替换之前，
+        # 否则会被当普通等宽代码块。securityLevel 在前端设 strict 防注入。
+        body = _re.sub(
+            r'<pre><code class="language-mermaid">(.*?)</code></pre>',
+            lambda m: ('<pre class="mermaid">'
+                       + m.group(1).strip()
+                       + '</pre>'),
             body, flags=_re.IGNORECASE | _re.DOTALL)
 
         # 代码块：等宽字体，透明底色（去除单独背景，统一随气泡/页面色）。
@@ -509,10 +539,11 @@ class ChatPage(QWidget):
         else:
             body = _html.escape(text).replace("\n", "<br>")
 
-        # 原文视图给气泡加 no-mathjax 类：MathJax 的 ignoreHtmlClass 会跳过它，
-        # 否则原文里的 \(...\) / \[...\] 定界符又会被 MathJax 扫回去渲染一遍。
-        skip_math = ' no-mathjax' if raw else ''
-        bubble = (f'<div class="{skip_math}" style="background:{bubble_bg};'
+        # 气泡统一带 .bubble 类（供 chat.html 归零首尾块级边距）；原文视图再加
+        # no-mathjax 类：MathJax 的 ignoreHtmlClass 会跳过它，否则原文里的
+        # \(...\) / \[...\] 定界符又会被 MathJax 扫回去渲染一遍。
+        classes = "bubble" + (" no-mathjax" if raw else "")
+        bubble = (f'<div class="{classes}" style="background:{bubble_bg};'
                   f'color:{text_color};'
                   f'border-radius:{radius};padding:8px 12px;max-width:100%;'
                   f'font-size:{font_size}px;line-height:1.5;white-space:normal;">'
@@ -558,7 +589,8 @@ class ChatPage(QWidget):
             self._render_raw[int(href[len("chat:md:"):])] = False
         else:
             return
-        self._reset_history_view(force=True)
+        # 原地重绘：翻转该条显示格式，不应把视图弹到底/改变当前阅读位置
+        self._reset_history_view(force=True, stick=False)
 
     def _empty_hint_html(self) -> str:
         pal = _chat_palette()
@@ -584,13 +616,17 @@ class ChatPage(QWidget):
             self._page_ready = True
             self._reset_history_view(force=True)
 
-    def _reset_history_view(self, force: bool = False) -> None:
+    def _reset_history_view(self, force: bool = False, stick: bool = True,
+                            force_pin: bool = False) -> None:
         """重建整段气泡 HTML 并注入 WebView（含流式中的助手回复与底部提示）。
 
         流式生成期间（worker 存活）走防抖合并，避免每个 token 都触发一次
         MathJax 全量重排；用户主动动作（发送 / 清空 / 字号 / 主题 / 切换原文）
         传 force=True 立即生效。页面未加载完成前的调用会被 _push_html 拦截，
         由 _on_page_loaded 负责在就绪后补齐。
+        stick=False 保持原滚动位置（换肤、原文切换等原地重绘）；
+        stick=True 追加渲染，是否贴底由页面按用户滚动位置决定；
+        force_pin=True 强制贴底（用户主动发送时）。
         """
         parts: list = []
         last_ts: float | None = None
@@ -623,30 +659,40 @@ class ChatPage(QWidget):
         if force or self._worker is None:
             self._pending_html = None
             self._flush_timer.stop()
-            self._push_html(html)
+            self._push_html(html, stick=stick, force_pin=force_pin)
         else:
             self._pending_html = html
+            self._pending_stick = stick
+            self._pending_force_pin = force_pin
             self._flush_timer.start()
 
     def _flush_stream(self) -> None:
         """防抖定时器触发：把攒下的最新 HTML 推给页面。"""
         if self._pending_html is None:
             return
-        self._push_html(self._pending_html)
+        self._push_html(self._pending_html,
+                        stick=getattr(self, "_pending_stick", True),
+                        force_pin=getattr(self, "_pending_force_pin", False))
         self._pending_html = None
 
-    def _push_html(self, html: str) -> None:
-        """经 window.__renderChat 把 HTML + 当前主题底色注入 WebView 页面。
+    def _push_html(self, html: str, stick: bool = True, force_pin: bool = False) -> None:
+        """经 window.__renderChat 把消息 HTML 注入 WebView 页面。
 
         页面未加载完成时（__renderChat 可能未定义）跳过注入，由 loadFinished
         后的 _on_page_loaded 重放当前视图补齐，避免提前 runJavaScript 抛错导致
-        首屏气泡 / LaTeX 公式不显示。
+        首屏气泡 / LaTeX 公式不显示。页面底色已透明，不再传 pageBg。
+        stick=True 追加渲染：是否贴底由页面按用户滚动是否已在底部决定（避免流式
+        把已上翻的视图拽回底部）；False 保持原滚动位置（原地重绘用）。
+        force_pin=True 强制贴底并复位跟贴（用户主动发送新消息时）。
         """
         if not self._page_ready:
             return
-        page_bg = _chat_palette()["page_bg"]
-        script = "window.__renderChat(%s, %s);" % (
-            _json.dumps(html), _json.dumps(page_bg))
+        # mermaid 主题跟随当前界面主题：亮色 'default'、暗色 'dark'，让 SVG 配色一致
+        mermaid_theme = ("dark" if ThemeManager().current() == ThemeManager.DARK
+                         else "default")
+        script = "window.__renderChat(%s, null, %s, %s, %s);" % (
+            _json.dumps(html), "true" if stick else "false",
+            _json.dumps(mermaid_theme), "true" if force_pin else "false")
         self.view.page().runJavaScript(script)
 
     def _scroll_to_bottom(self) -> None:
@@ -654,22 +700,15 @@ class ChatPage(QWidget):
             "window.scrollTo(0, document.body.scrollHeight);")
 
     def apply_theme_colors(self) -> None:
-        """把当前主题的 WebView 视图级底色同步到 Chromium 页面背景。
+        """把 WebView 视图级底色设为透明，让页面透出跟随 QSS 的父容器底色。
 
-        用于消除「首帧白闪」：QWebEnginePage.setBackgroundColor 设定的是合成器
-        铺底颜色，早于任何 DOM/CSS，因此切到「对话」Tab、WebView 首次提交渲染时
-        即已是主题色。主题切换（_on_toggle_theme）时也调用此方法保持同步。
-
-        注意：此处刻意用 ThemeManager().current() 而非 _chat_palette()——后者在
-        ChatPage.__init__ 阶段可能读到尚未 apply 的默认主题（暗），导致亮色用户
-        拿到暗色铺底、与 JS 上色后的 body 形成上下分色。current() 反映实际生效
-        的主题，apply_theme() 之后即为真值。
+        这是「对话区换肤滞后」的根因修复：原先这里按主题铺实色（#161B26/#FFFFFF），
+        切主题时要等 JS(__renderChat) 重涂才变、且与外层 QSS 之间易出现上下分色。
+        改为透明后，外层 apply_theme(QSS) 一换、本区域即时显新底色，无需 JS 参与。
+        setBackgroundColor(Qt.transparent) 是 Qt 支持的稳定组合（DOM 透明时透出
+        QWidget 父色，实测无白闪）。保留此方法名以兼容 main_window 的切换调用。
         """
-        if ThemeManager().current() == ThemeManager.LIGHT:
-            page_bg = "#FFFFFF"
-        else:
-            page_bg = "#161B26"
-        self.view.page().setBackgroundColor(QColor(page_bg))
+        self.view.page().setBackgroundColor(Qt.GlobalColor.transparent)
 
     # ------------------------------------------------------------------ #
     # provider 选择
@@ -724,11 +763,12 @@ class ChatPage(QWidget):
         self.session.add_user(text)
         self.input.clear()
 
-        # 渲染：重建整段（含新增用户气泡），立即生效
+        # 渲染：重建整段（含新增用户气泡），立即生效。用户主动发送：强制贴底
+        # 并复位跟贴（force_pin），避免此前上翻状态导致新消息也停在旧位置。
         self._pending_assistant = []
         self._last_stats = ""
         self._notice_html = ""
-        self._reset_history_view(force=True)
+        self._reset_history_view(force=True, force_pin=True)
 
         self._set_busy(True)
         self._worker = _ChatWorker(
@@ -868,5 +908,6 @@ class ChatPage(QWidget):
                               if self._worker is None else self.tr("生成中…", "Generating…"))
         self.stop_btn.setText(self.tr("停止", "Stop"))
         self.clear_btn.setText(self.tr("清空", "Clear"))
-        # 重放气泡（角色名 / 统计文案随语言刷新）
-        self._reset_history_view()
+        # 重放气泡（角色名 / 统计文案随语言/换肤刷新）。属原地重绘，保持滚动位置，
+        # 不再每次切主题都把对话弹到最底部。
+        self._reset_history_view(stick=False)

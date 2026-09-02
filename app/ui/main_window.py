@@ -8,6 +8,7 @@ import os
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
@@ -39,8 +40,12 @@ from .api_page import ApiPage
 from .chat_page import ChatPage
 from .gateway_page import GatewayPage
 from .i18n import LanguageManager
+from .providers_bar import ProvidersBar
 from .theme_manager import ThemeManager
 from .widgets import MessageBox
+
+# 悬浮面板开关的持久化键（QSettings）
+_BAR_ON_KEY = "ui/providers_bar_on"
 
 
 def _make_tray_icon() -> QIcon:
@@ -201,6 +206,14 @@ class MainWindow(QMainWindow):
         self.chat_page = ChatPage(gateway)
         self.tabs.addTab(self.chat_page, self.lang.tr("对话", "Chat"))
 
+        # 透明悬浮 Provider 面板：展示运行中的 provider，记住开关状态。
+        # 不设父窗口：面板是独立顶层窗口，展示/隐藏只受开关控制，
+        # 主窗口隐藏到托盘时面板保持显示，不被连带隐藏。
+        self._settings = QSettings("LightAIBox", "LightAIBox")
+        self.providers_bar = ProvidersBar(gateway)
+        self.providers_bar.set_bar_visible(
+            bool(self._settings.value(_BAR_ON_KEY, False, type=bool)))
+
         self._build_controls()
         self._retranslate()
 
@@ -313,6 +326,7 @@ class MainWindow(QMainWindow):
         running" 而崩溃，故先 shutdown() 收尾，再 quit()。
         """
         self.chat_page.shutdown()
+        self.providers_bar.shutdown()
         QApplication.instance().quit()
 
     def closeEvent(self, event):
@@ -324,6 +338,7 @@ class MainWindow(QMainWindow):
         """
         if self._tray is None:
             self.chat_page.shutdown()
+            self.providers_bar.shutdown()
             super().closeEvent(event)
             return
 
@@ -342,9 +357,13 @@ class MainWindow(QMainWindow):
             # 点弹窗右上角 ✕（或 Esc）：仅关闭弹窗，不做任何处理
             close_value=QMessageBox.Cancel,
         )
+        # 面板是独立「总在最前」窗口：让本确认框也置顶，显示在面板之上，
+        # 既不隐藏面板、也不会因面板遮挡而点不到按钮。
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         dlg.exec()
         result = dlg.result()
-        # 仅两个按钮的返回值触发动作；✕（Cancel）代表用户取消操作，保持现状
+        # 仅两个按钮的返回值触发动作；✕（Cancel）代表用户取消操作，保持现状。
+        # 悬浮面板从不在此被隐藏：主窗口操作不影响面板的显示与位置。
         if result == QMessageBox.Save:
             self.hide()
             self._tray_show_icon()
@@ -376,6 +395,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, self.lang.tr("统一 API", "Unified API"))
         self.tabs.setTabText(2, self.lang.tr("对话", "Chat"))
         self._sync_theme_controls()
+        self._sync_bar_controls()
         self.gateway_page.retranslate()
         self.api_page.retranslate()
         self.chat_page.retranslate()
@@ -411,6 +431,13 @@ class MainWindow(QMainWindow):
         self.lang_btn.setToolTip("Switch language / 切换语言")
         self.lang_btn.clicked.connect(self._on_toggle_language)
         layout.addWidget(self.lang_btn)
+
+        # 透明悬浮 Provider 面板开关
+        self.bar_btn = QPushButton()
+        self.bar_btn.setProperty("class", "ghost")
+        self.bar_btn.setCheckable(True)
+        self.bar_btn.clicked.connect(self._on_toggle_bar)
+        layout.addWidget(self.bar_btn)
 
         # 无边框窗口没有原生最小化/最大化/关闭按钮，这里补一组（自绘图标，
         # 保证「方框 / 重叠方框」等图标视觉尺寸一致）
@@ -475,6 +502,24 @@ class MainWindow(QMainWindow):
     def _on_toggle_language(self):
         self.lang.toggle()
         self._retranslate()
+
+    def _on_toggle_bar(self):
+        """开关透明悬浮 Provider 面板，并持久化用户选择。"""
+        on = self.bar_btn.isChecked()
+        self.providers_bar.set_bar_visible(on)
+        self._settings.setValue(_BAR_ON_KEY, on)
+        self._settings.sync()
+        self._sync_bar_controls()
+
+    def _sync_bar_controls(self):
+        """让悬浮面板开关按钮反映当前开 / 关状态。"""
+        on = self.providers_bar.isVisible()
+        self.bar_btn.setChecked(on)
+        self.bar_btn.setText(self.lang.tr("悬浮面板", "Floating bar"))
+        self.bar_btn.setToolTip(
+            self.lang.tr("开关 Provider 悬浮面板（当前：开）"
+                         if on else "开关 Provider 悬浮面板（当前：关）",
+                         "Toggle the floating providers bar"))
 
     # ------------------------------------------------------------------ #
     # 无边框窗口拖动：按住任意「非交互」空白处（Tab 栏空白、页面容器背景等）
@@ -624,6 +669,12 @@ class MainWindow(QMainWindow):
         elif et == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.LeftButton and not self.isFullScreen():
                 pos = event.globalPosition().toPoint()
+                # 关键：只处理落在「本窗口」内的按下。按下落在其它顶层窗口
+                # （独立悬浮面板）时必须放行，否则主窗口的全局过滤器会按主窗口
+                # 几何误判——拖动面板重叠在主窗口边缘时会把主窗口缩放/拖走。
+                w0 = QApplication.instance().widgetAt(pos)
+                if w0 is None or w0.window() is not self:
+                    return super().eventFilter(obj, event)
                 # 优先：命中四边/四角 → 交给系统原生缩放窗口
                 edges = self._resize_edges(pos)
                 if edges:

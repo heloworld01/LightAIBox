@@ -7,19 +7,21 @@
 
   职责：
     1. 提供 #messages 容器，Python 端把「气泡 HTML」整体注入（innerHTML 替换）。
-    2. 加载本地打包的 MathJax v3（tex-chtml，随 app/resources 分发，离线可用）。
-    3. 暴露 window.__renderChat(html, pageBg)：
-       设消息 HTML + 页面底色 -> MathJax 重排公式 -> 滚到底部。
+    2. 加载本地打包的 MathJax v3（tex-chtml）与 mermaid（均随 app/resources 分发，
+       完全离线可用），分别渲染 LaTeX 公式与 mermaid 图。
+    3. 暴露 window.__renderChat(html, _pageBg, stick, mermaidTheme)：设消息 HTML
+       -> mermaid 图 -> MathJax 重排公式 -> 按 stick 贴底/还原滚动。
 
-  配色均由 Python 端经 _chat_palette() 内联注入到气泡；此处仅设基础版式与
-  MathJax 配置。点击 #messages 内 a[href^="chat:"] 阻止默认跳转（由 Python 端
-  QWebEnginePage.acceptNavigationRequest 拦截处理）。
+  页面整体透明，透出跟随 QSS 的父容器底色以消除换肤滞后；气泡配色仍由 Python 端
+  经 _chat_palette() 内联注入到各气泡元素。点击 #messages 内 a[href^="chat:"]
+  阻止默认跳转（由 Python 端 QWebEnginePage.acceptNavigationRequest 拦截处理）。
 -->
 <style>
-  /* 透明打底：WebView 原生窗口背景透出作为「未上色前」的底色（配合 Python
-     侧 setBackgroundColor 消除首帧白闪）。上色后由下方 html{min-height} 实色
-     覆盖，不会露出原生色。绝不能在这里写死某个主题的实色——否则切换主题时
-     body 被 JS 涂成新主题色，而硬编码色会把另一层留成旧主题色，出现上下分色。 */
+  /* 对话页整体透明：不再自绘主题实色，而是透出底下跟随 QSS 的窗口/父容器底色。
+     切主题时外层 Qt chrome 换 QSS 即时生效，WebView 因透明同步显出新底色，
+     消掉「中间大空白区滞后一帧 / 上下分色」的问题（JS 无需再为换色重涂页面）。
+     注意：Python 侧须把 QWebEnginePage.setBackgroundColor 设为 Qt.transparent，
+     否则 Chromium 会在透明 DOM 之下铺默认白底；已实测透明+父色透出无白闪。 */
   html, body {
     margin: 0;
     padding: 8px;
@@ -27,19 +29,32 @@
     background-color: transparent;
     font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
   }
-  /* 让 html 始终铺满整个滚动区（含内容溢出后的视口以下部分），并用 --page-bg
-     实色绘制。body 高度只包住内容，若仅给 body 上色，溢出视口的下半截会露出
-     原生背景色（暗），导致亮色主题下「上亮下暗」的分界。html 有实色背景时会
-     propagate 到 canvas，使整页（含溢出区）都是同一主题色。--page-bg 由
-     __renderChat 注入，默认回退暗色，保证首帧即便 JS 未及时跑也不是纯白。 */
+  /* 保持 html 至少占满视口，使内容不满一屏时整页仍按透明渲染、滚动到底正常。 */
   html {
     min-height: 100%;
-    background-color: var(--page-bg, #161B26);
   }
   /* #messages 直接承载 Python 端生成的富文本气泡 */
   mjx-container {
     line-height: normal;
   }
+  /* 消除气泡上下过大空隙：markdown 把文本包成 <p>（UA 默认 margin-block 1em），
+     叠加气泡自身 padding 后，单段回答的文字与气泡顶/底之间会空出近 30px。
+     这里把气泡内「首块级元素的上边距 / 末块级元素的下边距」归零——只削贴边那道，
+     中段之间的间距保持不变，故多段落仍正常分隔。通配 * 以同时覆盖标题、列表、
+     代码块、表格、引用等所有块级首尾项。 */
+  #messages .bubble > *:first-child { margin-top: 0 !important; }
+  #messages .bubble > *:last-child  { margin-bottom: 0 !important; }
+
+  /* 细滚动条：对话滚动条是 Chromium 绘制的文档滚动条，不随 Qt qss；这里用
+     ::-webkit-scrollbar 收窄（默认 ~15px → 6px）。页面底色透明，轨道留空、
+     拇指用半透明灰，在亮/暗主题下都适看。 */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.45);
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.65); }
 </style>
 <script>
   // MathJax v3 初始化配置必须在加载 tex-chtml.js 之前生效
@@ -64,6 +79,7 @@
   };
 </script>
 <script src="vendor/mathjax/tex-chtml.js" id="MathJax-script" async></script>
+<script src="vendor/mermaid/mermaid.min.js"></script>
 <script>
   // MathJax 尚未就绪时的会话内排队：先注入 HTML，等 MathJax ready 后再重排。
   window.__mathJaxReady = new Promise(function (resolve) {
@@ -78,26 +94,99 @@
     }, 30);
   });
 
+  // mermaid 尚未就绪时的会话内排队。mermaid.min.js 是同步 UMD，加载后即有
+  // window.mermaid.run；此处轮询兜底，避免竞态。
+  window.__mermaidReady = new Promise(function (resolve) {
+    window.__resolveMermaidReady = resolve;
+  });
+  (function pollMermaid() {
+    if (window.mermaid && window.mermaid.run) {
+      window.__resolveMermaidReady();
+    } else {
+      setTimeout(pollMermaid, 30);
+    }
+  })();
+
+  // 渲染消息区内的 .mermaid 块（Python 端把 ```mermaid 围栏包成
+  // <pre class="mermaid">）。theme 由 Python 端按当前主题传入（'default'/'dark'），
+  // 使 mermaid 的 SVG 配色与界面一致。startOnLoad 关掉，避免它监听 DOM 自动跑，
+  // 统一由 __renderChat 在每次 innerHTML 替换后手动 run。
+  function _runMermaid(theme) {
+    return window.__mermaidReady.then(function () {
+      var nodes = document.querySelectorAll('#messages pre.mermaid');
+      if (!nodes.length) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: theme || 'default' });
+        return mermaid.run({ nodes: nodes });
+      } catch (e) { console.warn('mermaid', e); }
+    }).catch(function (e) { console.warn('mermaid', e); });
+  }
+
   function _scrollBottom() {
     window.scrollTo(0, document.body.scrollHeight);
   }
 
-  // 供 Python 端调用：整体替换消息区 HTML 并让 MathJax 重排
-  window.__renderChat = function (html, pageBg) {
+  // 记录滚动位置：innerHTML 整体替换会把 scrollTop 重置为 0，MathJax 异步重排又
+  // 会改变内容高度。原地重绘（换肤 / 原文切换）需要「看起来没动」，故先记当前占
+  // 文档比例，重建后按同比例还原——即便重排后 scrollHeight 变化也尽量贴近原位。
+  function _saveScrollRatio() {
+    var max = document.documentElement.scrollHeight - window.innerHeight;
+    return max > 0 ? window.scrollY / max : 0;
+  }
+  function _restoreScrollRatio(ratio) {
+    var max = document.documentElement.scrollHeight - window.innerHeight;
+    window.scrollTo(0, Math.max(0, ratio * max));
+  }
+
+  // 是否「贴在底部」：流式追加新内容时，只有用户本来就在底部才自动跟贴；一旦
+  // 用户向上滚动查阅，就暂停自动跟贴，避免被逐个 token 拽回底部。滚回底部附近
+  // 即自动恢复跟贴。阈值 _PIN_H 内视为贴底（内容不满一屏时恒贴底）。
+  var _PIN_H = 4;
+  var _pinned = true;
+  function _updatePinned() {
+    var max = document.documentElement.scrollHeight - window.innerHeight;
+    _pinned = (max <= 0) || (window.scrollY >= max - _PIN_H);
+  }
+  window.addEventListener('scroll', _updatePinned, { passive: true });
+
+  // 供 Python 端调用：整体替换消息区 HTML 并渲染 mermaid + MathJax。
+  //   html      ：气泡整段 HTML
+  //   _pageBg   ：已废弃（页面改透明），保留位参兼容旧调用
+  //   stick     ：true/省略 -> 追加渲染（是否贴底再按 _pinned 决定）
+  //               false     -> 保持原滚动位置（换肤、原文/渲染切换等原地重绘用）
+  //   mermaidTheme：'default'（亮）/ 'dark'（暗），Python 按当前主题传入
+  //   forcePin  ：用户主动发送新消息时为 true，强制贴底并复位 _pinned
+  window.__renderChat = function (html, _pageBg, stick, mermaidTheme, forcePin) {
     var el = document.getElementById('messages');
-    // 用 CSS 变量驱动 html 实色背景（见上方 html{min-height} 规则），使整页
-    // 含溢出视口的下半截都涂成当前主题色；同时设 body 兜底旧版/异常路径。
-    if (pageBg) {
-      document.documentElement.style.setProperty('--page-bg', pageBg);
-      document.body.style.backgroundColor = pageBg;
-    }
+    if (forcePin) { _pinned = true; }
+    // 追加渲染：仅当用户已在底部时才跟贴；否则保留当前绝对滚动位置（阅读中的
+    // 文本不随下方内容增长而下移）。原地重绘(stick=false)则按比例还原。
+    var followBottom = stick !== false && _pinned;
+    var savedY = followBottom ? 0 : window.scrollY;
     el.innerHTML = html;
-    _scrollBottom();
-    window.__mathJaxReady.then(function () {
-      try {
-        MathJax.typesetPromise([el]).then(_scrollBottom).catch(_scrollBottom);
-      } catch (e) { _scrollBottom(); }
-    });
+    // 先跑 mermaid（把 pre.mermaid → SVG，会改变布局），再让 MathJax 重排公式
+    //（skipHtmlTags 里的 pre/code 不会吃掉公式；mermaid 已先转成 svg）。两者都
+    // 完成后统一按 followBottom 决定贴底或还原滚动位置，避免重排过程中反复跳动。
+    window.__mermaidReady
+      .then(function () { return _runMermaid(mermaidTheme); })
+      .then(function () { return window.__mathJaxReady; })
+      .then(function () { return MathJax.typesetPromise([el]); })
+      .then(function () {
+        if (followBottom) {
+          _scrollBottom();
+        } else {
+          var max = document.documentElement.scrollHeight - window.innerHeight;
+          window.scrollTo(0, Math.min(savedY, Math.max(0, max)));
+        }
+      })
+      .catch(function () {
+        if (followBottom) {
+          _scrollBottom();
+        } else {
+          var max = document.documentElement.scrollHeight - window.innerHeight;
+          window.scrollTo(0, Math.min(savedY, Math.max(0, max)));
+        }
+      });
   };
 
   // 「原文/渲染」切换链接拦截。
