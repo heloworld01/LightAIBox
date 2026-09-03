@@ -17,7 +17,7 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
 - **Call logging & stats** — SQLite-persisted records of tokens, latency, speed, and status per call, filterable by date / provider, with aggregated statistics.
-- **Floating Provider bar** — an independent, always-on-top, translucent panel floating at the bottom of the screen that lists every running provider and its remaining quota at a glance. It stays visible even when the main window is minimized to the tray; drag it anywhere, or click the lock button to stop it moving. Toggled from the corner of the tab bar (state remembered across restarts).
+- **Floating Provider bar** — an independent, always-on-top, translucent panel floating at the bottom of the screen with a "Usage" header that lists every running provider and its remaining quota (model, usage / quota right-aligned) at a glance. It stays visible even when the main window is minimized to the tray; drag it anywhere, or use the "Lock/Locked" button (top-right) to stop it moving (turns green when locked) and the "Close" button to dismiss it. Hidden by default on every launch; toggle it from the corner of the tab bar, text follows the language switch.
 - **Runs in the background** — closing the window minimizes it to the system tray while the unified API keeps serving. Single-click the tray icon to show / hide the window; right-click for show / quit.
 
 ## When to use Auto Mode
@@ -110,7 +110,7 @@ app/
 ├── chat_session.py  # chat session: multi-turn history + display timestamps
 └── ui/              # PySide6 UI
     ├── chat_page.py # Chat tab: WeChat-style bubbles + MathJax rendering
-    ├── providers_bar.py # floating always-on-top panel: running providers + quota
+    ├── providers_bar.py # floating always-on-top panel: header + running providers + quota (right-aligned model/usage, lock/close buttons)
     └── resources/chat/  # chat container HTML + bundled MathJax v3 + mermaid (offline)
 ```
 

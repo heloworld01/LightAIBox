@@ -40,6 +40,7 @@ from ..chat_session import ChatSession
 from .i18n import LanguageManager
 from .theme_manager import ThemeManager
 from .widgets import SectionHeader
+from ..client import THINK_TAG, THINK_END_TAG
 
 _ROLE_USER = "user"
 _ROLE_ASSISTANT = "assistant"
@@ -92,17 +93,19 @@ class _ChatWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, gateway: Gateway, messages: list,
-                 provider_id=None, parent=None):
+                 provider_id=None, thinking_enabled: bool = False, parent=None):
         super().__init__(parent)
         self._gateway = gateway
         self._messages = messages
         self._provider_id = provider_id
+        self._thinking_enabled = thinking_enabled
         self._stop = False
 
     def run(self) -> None:
         try:
             it = self._gateway.chat_stream(
-                self._messages, provider_id=self._provider_id)
+                self._messages, provider_id=self._provider_id,
+                thinking_enabled=self._thinking_enabled)
             try:
                 while not self._stop:
                     try:
@@ -192,8 +195,19 @@ class ChatPage(QWidget):
         self._zombie_timer.timeout.connect(self._on_zombie_tick)
         self._pending_assistant: list = []
         self._last_stats: str = ""  # 上次助手回复的 token 统计（气泡内显示）
+        # provider 下拉的数据签名：仅当可用集合变化时才重建下拉，避免轮询
+        # 反复 clear() 把用户正在展开的下拉强制关闭（与 gateway_page 的
+        # _provider_filter_sig 同思路）。
+        self._provider_sig: tuple | None = None
         # 每个助手消息的显示格式：msg_index -> 是否显示原始 markdown（默认渲染）
         self._render_raw: dict = {}
+        # 思考模式开关（仅当次会话生效，QSettings 持久化记忆偏好）
+        self._thinking_on = self._settings.value(
+            "chat/thinking", False, type=bool)
+        # 每封助手消息的思考内容展开状态：msg_index -> bool（默认折叠）
+        self._think_open: dict = {}
+        # 流式中正在累积的思考内容
+        self._pending_thinking: list = []
         # 底部瞬时提示（调用失败 / 已停止），随消息流一起注入视图底部
         self._notice_html: str = ""
         # WebView 页面（含 MathJax）是否已加载完成；加载前不注入，避免
@@ -202,7 +216,15 @@ class ChatPage(QWidget):
         # 助手头像：打包 logo.png 读成 data URI（圆形裁切展示），避免每次渲染重读盘。
 
         self._build_ui()
+        self._update_think_btn_text()
         self.refresh_providers()
+        # 轮询刷新模型下拉：AI 网关页增删/启停 provider、配额用尽自动关闭等
+        # 状态变化不会通知对话页，这里用与 ProvidersBar 相同的定时轮询方式
+        # 保持下拉与网关数据源实时同步（签名去重见 refresh_providers）。
+        self._provider_timer = QTimer(self)
+        self._provider_timer.setInterval(1200)
+        self._provider_timer.timeout.connect(self.refresh_providers)
+        self._provider_timer.start()
         # 首次内容渲染改由 _on_page_loaded（loadFinished）触发，确保注入的
         # HTML/MathJax 在已就绪的页面里被扫描；此处不再提前 push。
         # self._reset_history_view()
@@ -234,6 +256,13 @@ class ChatPage(QWidget):
         self.font_combo.setCurrentIndex(idx if idx >= 0 else 1)
         self.font_combo.currentIndexChanged.connect(self._on_font_changed)
 
+        # 思考模式开关（可勾选按钮），持久化偏好
+        self.think_btn = QPushButton()
+        self.think_btn.setCheckable(True)
+        self.think_btn.setChecked(self._thinking_on)
+        self.think_btn.setProperty("class", "ghost")
+        self.think_btn.clicked.connect(self._on_toggle_thinking)
+
         top = QWidget()
         tl = QHBoxLayout(top)
         tl.setContentsMargins(0, 0, 0, 0)
@@ -243,6 +272,7 @@ class ChatPage(QWidget):
         tl.addWidget(self.provider_combo)
         tl.addWidget(self.font_label)
         tl.addWidget(self.font_combo)
+        tl.addWidget(self.think_btn)
         root.addWidget(top)
 
         # 对话记录：QWebEngineView 承载 chat.html（MathJax 渲染公式）。
@@ -501,12 +531,14 @@ class ChatPage(QWidget):
 
     def _render_block(self, role: str, text: str, meta: str = "",
                       font_size: int = 13, msg_index: int | None = None,
-                      show_time: bool = False, mtime: float | None = None) -> str:
+                      show_time: bool = False, mtime: float | None = None,
+                      thinking: str = "") -> str:
         """把一条消息渲染为微信式气泡（圆形头像 + 带头尾气泡）。
 
         布局（flex）：assistant 头像在左、气泡在右；user 头像在右、气泡在左。
         两端不再用 <table align> 浮动。assistant 气泡下方带 token 统计与
         「原始/渲染」切换链接；show_time=True 时上方插入居中时间条。
+        thinking 非空时（assistant），在气泡正文上方插入可折叠的思考块。
         """
         pal = _chat_palette()
         text = str(text)
@@ -523,10 +555,14 @@ class ChatPage(QWidget):
 
         raw = False
         under = ""
+        think_html = ""
         if role == _ROLE_ASSISTANT:
             raw = msg_index is not None and self._render_raw.get(msg_index, False)
             body = (_html.escape(text).replace("\n", "<br>") if raw
                     else self._render_markdown(text, font_size))
+            # 思考块：可折叠（默认折叠），标题行可点击展开/关闭
+            if thinking:
+                think_html = self._thinking_html(msg_index, thinking, font_size)
             bits = []
             if meta:
                 bits.append(f'<span>{_html.escape(meta)}</span>')
@@ -547,7 +583,7 @@ class ChatPage(QWidget):
                   f'color:{text_color};'
                   f'border-radius:{radius};padding:8px 12px;max-width:100%;'
                   f'font-size:{font_size}px;line-height:1.5;white-space:normal;">'
-                  f'{body}</div>')
+                  f'{think_html}{body}</div>')
 
         bubble_group = self._bubble_group_html(role, bubble, pal, bubble_bg)
 
@@ -579,6 +615,39 @@ class ChatPage(QWidget):
         return (f'<a href="{target}" style="color:{pal["meta"]};'
                 f'text-decoration:none;">{_html.escape(label)}</a>')
 
+    def _thinking_html(self, msg_index: int | None, thinking: str,
+                       font_size: int) -> str:
+        """生成助手气泡内可折叠的「思考」块（默认折叠，点击标题展开/关闭）。
+
+        href 用 chat:think:<idx> 编码，点击经 acceptNavigationRequest 转到
+        _on_anchor_clicked 翻转 _think_open 状态后原地重放。思考文本按 markdown
+        渲染（仅保留正文子集，代码/公式可正常显示）；样式与气泡正文区分：
+        左侧浅色竖线 + 略浅的文字色，一眼可辨「思考过程」与「最终回答」。
+        """
+        pal = _chat_palette()
+        opened = msg_index is not None and self._think_open.get(msg_index, False)
+        tr = self.tr
+        if opened:
+            label = tr("收起思考", "Collapse thinking")
+        else:
+            label = tr("展开思考", "Expand thinking")
+        # 折叠时只显示标题行；展开时渲染思考内容并包进带左边线的容器
+        if not opened:
+            inner = ""
+        else:
+            inner = (f'<div style="margin-top:4px;padding-left:8px;'
+                     f'border-left:2px solid {pal["meta"]};'
+                     f'color:{pal["meta"]};'
+                     f'font-size:{font_size - 1}px;line-height:1.5;">'
+                     f'{self._render_markdown(thinking, font_size - 1)}'
+                     f'</div>')
+        href = f'chat:think:{msg_index}'
+        return (f'<div style="margin:2px 0 6px;font-size:12px;">'
+                f'<a href="{href}" style="color:{pal["meta"]};'
+                f'text-decoration:none;font-weight:600;">'
+                f'{_html.escape(label)}</a>'
+                f'{inner}</div>')
+
     @Slot(QUrl)
     def _on_anchor_clicked(self, url):
         """处理气泡内切换链接点击，翻转对应消息的显示格式并重放。"""
@@ -587,6 +656,9 @@ class ChatPage(QWidget):
             self._render_raw[int(href[len("chat:raw:"):])] = True
         elif href.startswith("chat:md:"):
             self._render_raw[int(href[len("chat:md:"):])] = False
+        elif href.startswith("chat:think:"):
+            idx = int(href[len("chat:think:"):])
+            self._think_open[idx] = not self._think_open.get(idx, False)
         else:
             return
         # 原地重绘：翻转该条显示格式，不应把视图弹到底/改变当前阅读位置
@@ -636,6 +708,7 @@ class ChatPage(QWidget):
             if isinstance(text, str) and text:
                 # 助手消息携带其统计（存于消息内嵌字段，若存在）；索引用于切换链接
                 meta = m.get("_meta", "")
+                thinking = m.get("_thinking", "")
                 ts = m.get("time")
                 # 首条消息或与上一条间隔 >5 分钟时显示时间分隔条
                 show_time = (ts is not None and (
@@ -644,14 +717,15 @@ class ChatPage(QWidget):
                     last_ts = ts
                 parts.append(self._render_block(
                     role, text, meta, self._font_size, i,
-                    show_time=show_time, mtime=ts))
+                    show_time=show_time, mtime=ts, thinking=thinking))
         if self._pending_assistant:
             # 流式中：整条视为「新的一段时间」，仅在最新一条之后显示时间
             now = _time.time()
             show_time = not parts or (last_ts is None or now - last_ts > 300)
             parts.append(self._render_block(
                 _ROLE_ASSISTANT, "".join(self._pending_assistant),
-                font_size=self._font_size, show_time=show_time, mtime=now))
+                font_size=self._font_size, show_time=show_time, mtime=now,
+                thinking="".join(self._pending_thinking)))
         if not parts:
             parts.append(self._empty_hint_html())
         html = "".join(parts) + self._notice_html
@@ -718,9 +792,17 @@ class ChatPage(QWidget):
         return None if data is None else int(data)
 
     def refresh_providers(self):
-        """重建 provider 下拉：Auto(自适应) + 所有已启用且未超配额的 provider。"""
-        previous = self.provider_combo.currentData()
+        """重建 provider 下拉：Auto(自适应) + 所有已启用且未超配额的 provider。
+
+        由构造时、语言切换、以及 1.2s 轮询定时器调用。provider 可用集合未变化时
+        直接跳过，避免高频轮询反复 clear() 下拉框，把用户正在展开的下拉强制关闭。
+        """
         providers = [p for p in self.gateway.providers.list() if p.is_available()]
+        sig = tuple((p.id, p.name, p.model) for p in providers)
+        if sig == self._provider_sig:
+            return
+        self._provider_sig = sig
+        previous = self.provider_combo.currentData()
         self.provider_combo.blockSignals(True)
         self.provider_combo.clear()
         self.provider_combo.addItem(
@@ -734,6 +816,16 @@ class ChatPage(QWidget):
 
     def _on_provider_changed(self):
         pass  # 选择在发送时生效
+
+    def _update_think_btn_text(self):
+        """思考按钮文案随状态/语言切换：开启→「思考：开」，关闭→「思考：关」。"""
+        if self._thinking_on:
+            self.think_btn.setText(self.tr("思考：开", "Thinking: on"))
+        else:
+            self.think_btn.setText(self.tr("思考：关", "Thinking: off"))
+        self.think_btn.setToolTip(self.tr(
+            "开启后，模型会在回答前先给出思考过程（支持折叠展开）",
+            "When on, the model shows its reasoning before the answer"))
 
     def _apply_input_font(self):
         """把当前字号应用到输入框，使其与气泡字号保持一致。"""
@@ -751,6 +843,12 @@ class ChatPage(QWidget):
         self._apply_input_font()
         self._reset_history_view(force=True)
 
+    def _on_toggle_thinking(self):
+        """思考模式开关：持久化偏好并刷新按钮文案。"""
+        self._thinking_on = self.think_btn.isChecked()
+        self._settings.setValue("chat/thinking", self._thinking_on)
+        self._update_think_btn_text()
+
     # ------------------------------------------------------------------ #
     # 发送 / 流式接收
     # ------------------------------------------------------------------ #
@@ -766,6 +864,7 @@ class ChatPage(QWidget):
         # 渲染：重建整段（含新增用户气泡），立即生效。用户主动发送：强制贴底
         # 并复位跟贴（force_pin），避免此前上翻状态导致新消息也停在旧位置。
         self._pending_assistant = []
+        self._pending_thinking = []
         self._last_stats = ""
         self._notice_html = ""
         self._reset_history_view(force=True, force_pin=True)
@@ -773,7 +872,7 @@ class ChatPage(QWidget):
         self._set_busy(True)
         self._worker = _ChatWorker(
             self.gateway, self.session.to_message_list(),
-            provider_id=pid)
+            provider_id=pid, thinking_enabled=self._thinking_on)
         self._worker.token.connect(self._on_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
@@ -781,7 +880,17 @@ class ChatPage(QWidget):
 
     @Slot(str)
     def _on_token(self, piece: str):
-        self._pending_assistant.append(piece)
+        # 思考增量被 THINK_TAG 包裹，与正文分离，避免混入回复文本
+        while THINK_TAG in piece:
+            before, _, rest = piece.partition(THINK_TAG)
+            if before:
+                self._pending_assistant.append(before)
+            think, _, after = rest.partition(THINK_END_TAG)
+            if think:
+                self._pending_thinking.append(think)
+            piece = after
+        if piece:
+            self._pending_assistant.append(piece)
         # 整段重建：确认消息 + 流式中的助手气泡，防抖刷盘
         self._reset_history_view()
 
@@ -795,9 +904,14 @@ class ChatPage(QWidget):
                 f"{result.total_tokens:,} tokens · "
                 f"{result.elapsed_ms / 1000:.1f}s")
         if full:
-            # 将统计内嵌到消息，供 _reset_history_view 重放时显示
+            # 将统计与思考内容内嵌到消息，供 _reset_history_view 重放时显示
             self.session.add_assistant(full)
             self.session.messages[-1]["_meta"] = self._last_stats
+        if self._pending_thinking:
+            thinking = "".join(self._pending_thinking).strip()
+            if thinking:
+                # 思考内容存到当前（或上一条）assistant 消息的 _thinking 字段
+                self.session.messages[-1]["_thinking"] = thinking
         self._cleanup_worker()
         self._reset_history_view()
         self._scroll_to_bottom()
@@ -815,6 +929,7 @@ class ChatPage(QWidget):
         w = self._worker
         self._worker = None
         self._pending_assistant = []
+        self._pending_thinking = []
         self._set_busy(False)
         if w is not None and w.isRunning():
             # 线程仍在运行（点了「停止/清空」）。不能直接丢引用——
@@ -882,6 +997,8 @@ class ChatPage(QWidget):
             self._cleanup_worker()
         self.session.clear()
         self._pending_assistant = []
+        self._pending_thinking = []
+        self._think_open = {}
         self._notice_html = ""
         self._reset_history_view(force=True)
 
@@ -900,7 +1017,10 @@ class ChatPage(QWidget):
         self.header.title_label.setText(self.tr("对话", "Chat"))
         self.provider_label.setText(self.tr("模型", "Model"))
         self.font_label.setText(self.tr("字号", "Size"))
-        self.refresh_providers()  # Auto 项文案随语言刷新
+        # Auto 项文案随语言刷新：签名去重会因 provider 集合未变而跳过，故先
+        # 重置签名强制重建，刷新首项「自动（自适应调度）」的新语言文案。
+        self._provider_sig = None
+        self.refresh_providers()
         self.input.setPlaceholderText(self.tr("输入消息…", "Type a message…"))
         self.hint_label.setText(self.tr("Enter 换行 · Ctrl+Enter 发送",
                                         "Enter new line · Ctrl+Enter send"))
@@ -908,6 +1028,7 @@ class ChatPage(QWidget):
                               if self._worker is None else self.tr("生成中…", "Generating…"))
         self.stop_btn.setText(self.tr("停止", "Stop"))
         self.clear_btn.setText(self.tr("清空", "Clear"))
+        self._update_think_btn_text()
         # 重放气泡（角色名 / 统计文案随语言/换肤刷新）。属原地重绘，保持滚动位置，
         # 不再每次切主题都把对话弹到最底部。
         self._reset_history_view(stick=False)

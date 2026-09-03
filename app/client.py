@@ -16,6 +16,13 @@ from .models import ClientResult, ContentBlock, Provider
 Message = dict
 
 
+# 流式增量前缀：区分普通文本与思考内容（同一 token 信号通道内复用）。
+# Python 端 _ChatWorker 原样上抛，由 ChatPage 解析；前缀本身转义后不会由
+# 模型文本伪造——模型输出经过 yield 前的统一包装，见各 client 的 yield 调用。
+THINK_TAG = "\x01think\x01"
+THINK_END_TAG = "\x01/think\x01"
+
+
 class ChatError(Exception):
     """调用失败的异常，携带 provider_id 便于记录。"""
 
@@ -58,12 +65,40 @@ class OpenAIClient(BaseClient):
             kwargs["base_url"] = base_url
         self._client = OpenAI(**kwargs)
 
+    def _apply_thinking(self, extra: dict, thinking_enabled: bool) -> None:
+        """把 thinking_enabled 映射为上游参数（chat / chat_stream 共用口径）。
+
+        - 官方 reasoning 模型（o3 / gpt-5 等）：用 reasoning_effort；
+        - Qwen / DeepSeek 等兼容网关：用 enable_thinking 与 vLLM 的
+          chat_template_kwargs（extra_body 合并进顶层）。
+        - **关闭也必须显式下发**：Qwen3 系列的对话模板默认 enable_thinking=True，
+          只靠"不发参数"是关不掉的——这是此前"关闭思考不生效"的根因。
+        - 仅当 provider 配了 base_url（即非官方直连）时才带这些扩展参数：
+          官方 API 会拒绝未知参数，且官方 reasoning 模型的思考增量本就不暴露在
+          delta 里，无需干预。
+        """
+        body = dict(extra.get("extra_body") or {})
+        if thinking_enabled:
+            extra.setdefault("reasoning_effort", "medium")
+            body["enable_thinking"] = True
+            body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
+        elif self.provider.base_url:
+            body["enable_thinking"] = False
+            body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+        else:
+            return
+        extra["extra_body"] = body
+
     def chat(self, messages: List[Message], **kwargs) -> ClientResult:
+        # 思考模式：与 chat_stream 同口径
+        extra = dict(kwargs)
+        self._apply_thinking(extra, extra.pop("thinking_enabled", False))
+
         start = time.perf_counter()
         resp = self._client.chat.completions.create(
             model=self.provider.model,
             messages=messages,
-            **kwargs,
+            **extra,
         )
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         usage = resp.usage
@@ -95,13 +130,17 @@ class OpenAIClient(BaseClient):
     def chat_stream(self, messages: List[Message], **kwargs) -> Generator[str, None, ClientResult]:
         from openai import Stream
 
+        # 思考模式：与 chat 同口径（见 _apply_thinking 说明）。
+        extra = dict(kwargs)
+        self._apply_thinking(extra, extra.pop("thinking_enabled", False))
+
         start = time.perf_counter()
         stream: Stream = self._client.chat.completions.create(
             model=self.provider.model,
             messages=messages,
             stream=True,
             stream_options={"include_usage": True},
-            **kwargs,
+            **extra,
         )
         chunks: List[str] = []
         usage = None
@@ -110,6 +149,16 @@ class OpenAIClient(BaseClient):
                 usage = chunk.usage
             delta = chunk.choices[0].delta if chunk.choices else None
             piece = getattr(delta, "content", None) if delta else None
+            # OpenAI reasoning 模型：思考增量字段名不统一——
+            #   openai 官方兼容层 / 多数网关用 reasoning_content；
+            #   vLLM(SGLang 等) webchat-instruct 这类用 reasoning。
+            # 两者都读，命中即视为思考段。
+            reasoning = None
+            if delta is not None:
+                reasoning = (getattr(delta, "reasoning_content", None)
+                             or getattr(delta, "reasoning", None))
+            if reasoning:
+                yield THINK_TAG + reasoning + THINK_END_TAG
             if piece:
                 chunks.append(piece)
                 yield piece
@@ -165,12 +214,16 @@ class AnthropicClient(BaseClient):
     def chat(self, messages: List[Message], **kwargs) -> ClientResult:
         system_parts, rest = self._split_messages(messages)
 
+        # Anthropic 协议 max_tokens 是必选参数；OpenAI 协议不需要。
+        # 对话页等调用方一般不显式传，这里给默认上限。
+        extra = dict(kwargs)
+        extra.setdefault("max_tokens", 8192)
         start = time.perf_counter()
         resp = self._client.messages.create(
             model=self.provider.model,
             system="\n".join(system_parts) if system_parts else None,
             messages=rest,
-            **kwargs,
+            **extra,
         )
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         usage = resp.usage
@@ -204,19 +257,39 @@ class AnthropicClient(BaseClient):
     def chat_stream(self, messages: List[Message], **kwargs) -> Generator[str, None, ClientResult]:
         system_parts, rest = self._split_messages(messages)
 
+        # max_tokens 是 Anthropic 协议必选参数，调用方缺省时给默认上限，
+        # 否则 messages.stream() 直接抛 missing required keyword-only argument。
+        extra = dict(kwargs)
+        extra.setdefault("max_tokens", 8192)
+
+        # 思考模式：调用方传 thinking_enabled=True 时打开上游 extended thinking。
+        # budget 取调用方 thinking_budget，否则用默认（1024，上游最小合法值）。
+        # 上游要求 max_tokens > budget，不足则抬升。
+        thinking_enabled = extra.pop("thinking_enabled", False)
+        if thinking_enabled:
+            budget = extra.pop("thinking_budget", 1024) or 1024
+            extra["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            if extra.get("max_tokens", 0) <= budget:
+                extra["max_tokens"] = budget + 1024
+
         start = time.perf_counter()
         with self._client.messages.stream(
             model=self.provider.model,
             system="\n".join(system_parts) if system_parts else None,
             messages=rest,
-            **kwargs,
+            **extra,
         ) as stream:
-            # 只把 text_delta 逐段上抛；tool_use 的 input_json 累积在最终 message 里，
-            # 由 get_final_message() 一次性取出，避免向上游逐段拼 JSON。
+            # 把 text_delta 逐段上抛；思考增量用 THINK_TAG 段落包装上抛；
+            # tool_use 的 input_json 累积在最终 message 里，由 get_final_message()
+            # 一次性取出，避免向上游逐段拼 JSON。
             for event in stream:
-                if (event.type == "content_block_delta"
-                        and getattr(event.delta, "type", None) == "text_delta"):
+                if event.type != "content_block_delta":
+                    continue
+                dtype = getattr(event.delta, "type", None)
+                if dtype == "text_delta":
                     yield event.delta.text
+                elif dtype == "thinking_delta":
+                    yield THINK_TAG + event.delta.thinking + THINK_END_TAG
 
             final = stream.get_final_message()
             elapsed_ms = int((time.perf_counter() - start) * 1000)

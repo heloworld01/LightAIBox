@@ -45,7 +45,6 @@ from .theme_manager import ThemeManager
 from .widgets import MessageBox
 
 # 悬浮面板开关的持久化键（QSettings）
-_BAR_ON_KEY = "ui/providers_bar_on"
 
 
 def _make_tray_icon() -> QIcon:
@@ -211,8 +210,10 @@ class MainWindow(QMainWindow):
         # 主窗口隐藏到托盘时面板保持显示，不被连带隐藏。
         self._settings = QSettings("LightAIBox", "LightAIBox")
         self.providers_bar = ProvidersBar(gateway)
-        self.providers_bar.set_bar_visible(
-            bool(self._settings.value(_BAR_ON_KEY, False, type=bool)))
+        # 面板右上角「关闭」按钮 → 同步主窗口开关状态并持久化
+        self.providers_bar.visibility_changed.connect(self._on_bar_closed)
+        # 悬浮面板每次启动默认隐藏（不跨重启记忆开关状态），需要时点角按钮开启
+        self.providers_bar.set_bar_visible(False)
 
         self._build_controls()
         self._retranslate()
@@ -399,6 +400,7 @@ class MainWindow(QMainWindow):
         self.gateway_page.retranslate()
         self.api_page.retranslate()
         self.chat_page.retranslate()
+        self.providers_bar.retranslate()
         # 托盘菜单文案跟随语言切换
         if self._tray is not None:
             self._tray_show_action.setText(
@@ -504,12 +506,17 @@ class MainWindow(QMainWindow):
         self._retranslate()
 
     def _on_toggle_bar(self):
-        """开关透明悬浮 Provider 面板，并持久化用户选择。"""
+        """开关透明悬浮 Provider 面板（会话内生效，不跨重启记忆）。"""
         on = self.bar_btn.isChecked()
         self.providers_bar.set_bar_visible(on)
-        self._settings.setValue(_BAR_ON_KEY, on)
-        self._settings.sync()
         self._sync_bar_controls()
+
+    def _on_bar_closed(self, _visible: bool):
+        """面板内「关闭」按钮触发：同步角落开关按钮状态。"""
+        # bar_btn 在 _build_controls() 里创建，晚于面板；启动早期面板被隐藏时
+        # 会拿不到 bar_btn，须防护。
+        if hasattr(self, "bar_btn"):
+            self._sync_bar_controls()
 
     def _sync_bar_controls(self):
         """让悬浮面板开关按钮反映当前开 / 关状态。"""

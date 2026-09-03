@@ -524,7 +524,7 @@ class GatewayPage(QWidget):
         lf = QVBoxLayout(log_box)
         lf.setContentsMargins(16, 16, 16, 16)
         lf.setSpacing(12)
-        self.log_header = SectionHeader(self.tr("调用记录（最近）", "Call Logs (Recent)"))
+        self.log_header = SectionHeader(self.tr("调用记录", "Call Logs"))
         lf.addWidget(self.log_header)
         # 过滤条：列表与统计均可按日期 / provider 过滤
         fbar = QHBoxLayout()
@@ -597,7 +597,10 @@ class GatewayPage(QWidget):
                 tr("合计", "Total"), tr("速度", "Speed"), tr("操作", "Actions")]
 
     def _rebuild_date_items(self):
-        """重建日期预设下拉项（文案随语言切换），保持原选中项。"""
+        """重建日期预设下拉项（文案随语言切换），保持原选中项。
+
+        首次构建（无既有选中项）默认选中「今天」。
+        """
         tr = self.tr
         current = self.log_date_combo.currentData()
         self.log_date_combo.blockSignals(True)
@@ -610,7 +613,9 @@ class GatewayPage(QWidget):
                           (tr("本月", "This month"), "month")):
             self.log_date_combo.addItem(text, key)
         idx = self.log_date_combo.findData(current)
-        self.log_date_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if idx < 0:
+            idx = self.log_date_combo.findData("today")   # 默认展示今天
+        self.log_date_combo.setCurrentIndex(max(0, idx))
         self.log_date_combo.blockSignals(False)
 
     def retranslate(self):
@@ -625,7 +630,7 @@ class GatewayPage(QWidget):
         self.reset_btn.setText(tr("重置配额", "Reset quota"))
         self.up_btn.setText(tr("↑ 上移", "↑ Up"))
         self.down_btn.setText(tr("↓ 下移", "↓ Down"))
-        self.log_header.title_label.setText(tr("调用记录（最近）", "Call Logs (Recent)"))
+        self.log_header.title_label.setText(tr("调用记录", "Call Logs"))
         self.log_date_label.setText(tr("日期:", "Date:"))
         self._rebuild_date_items()
         self.log_provider_combo.setItemText(0, tr("全部", "All"))
