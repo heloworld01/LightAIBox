@@ -88,11 +88,13 @@ def _to_internal_messages(payload):
         role = m.get("role", "user")
         content = m.get("content", "")
         if isinstance(content, list):
-            # Anthropic 块列表：只要含工具块（tool_use / tool_result / thinking），
-            # 就保留完整块列表（含 text 块）原样回传，否则上游 tool_result 找不到
-            # 对应的 tool_use 会直接 400；纯 text 块列表则拼接为文本。
-            has_non_text = any(isinstance(b, dict) and b.get("type") != "text"
-                               for b in content)
+            # 块列表：只要含「工具块」或「图片块」就保留完整块列表原样回传——
+            # 工具块需让上游 tool_result 找到对应 tool_use（否则 400）；
+            # 图片块是多模态请求的载体，丢失会导致图片内容被静默丢弃。
+            # 仅纯 text 块列表才拼接为字符串。
+            has_non_text = any(
+                isinstance(b, dict) and b.get("type", "").lower()
+                not in ("text",) for b in content)
             if has_non_text:
                 pass  # content 保持块列表
             else:

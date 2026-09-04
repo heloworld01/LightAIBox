@@ -12,9 +12,9 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 
 - **Unified API proxy** — a single `chat` / `chat_stream` interface hides the OpenAI / Anthropic protocol differences. Call a specific model, or leave it unset to auto-select a provider by policy.
 - **Claude Code ready** — the Anthropic-compatible endpoint fully passes through `tools` and multi-turn `tool_result`, with spec-compliant streaming `tool_use` events, so it can drive Claude Code's multi-step agent loop directly.
-- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, and time separators (see [Built-in Chat](#built-in-chat)).
-- **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model), with background connectivity testing that never blocks the UI.
-- **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure.
+- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, collapsible **thinking** display, **image uploads for multimodal chats**, and time separators (see [Built-in Chat](#built-in-chat)).
+- **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model, multimodal flag), with background connectivity testing that never blocks the UI.
+- **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure. Image requests route only to providers flagged as multimodal (a clear error instead of silently dropping images); mislabeled providers get the flag auto-revoked after repeated image failures.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
 - **Call logging & stats** — SQLite-persisted records of tokens, latency, speed, and status per call, filterable by date / provider, with aggregated statistics.
 - **Floating Provider bar** — an independent, always-on-top, translucent panel floating at the bottom of the screen with a "Usage" header that lists every running provider and its remaining quota (model, usage / quota right-aligned) at a glance. It stays visible even when the main window is minimized to the tray; drag it anywhere, or use the "Lock/Locked" button (top-right) to stop it moving (turns green when locked) and the "Close" button to dismiss it. Hidden by default on every launch; toggle it from the corner of the tab bar, text follows the language switch.
@@ -47,7 +47,7 @@ Linux, `~/Library/Application Support/LightAIBox/` on macOS).
 
 ### Add a provider
 
-Click **Add** in the provider list and fill in the name (unique), protocol type, base URL (the trailing `/v1` is optional), API key, and model. Then use the row buttons to edit / copy / delete / enable-disable / reset quota / test connectivity.
+Click **Add** in the provider list and fill in the name (unique), protocol type, base URL (the trailing `/v1` is optional), API key, model, and optionally tick **multimodal (images)**. Enable / disable is controlled only by the row button (the edit dialog never changes it). Then use the row buttons to edit / copy / delete / reset quota / test connectivity.
 
 ## Unified API (HTTP)
 
@@ -92,6 +92,13 @@ same gateway, so it works with any configured provider (or `auto` scheduling):
   bundled mermaid v10** (fully offline), themed to match the current dark / light UI.
 - **Raw / Render toggle** — a link under each assistant reply flips it between the raw
   Markdown and the rendered view.
+- **Thinking mode** — a "Thinking: on / off" toggle in the top bar (persisted). When on,
+  the model's reasoning streams into a collapsible block above the answer, collapsed by
+  default; applies to subsequent messages only.
+- **Multimodal images** — the "🖼 Image" button next to the input picks local images
+  (png / jpg / jpeg / gif / webp, multi-select), sent base64-encoded with the next
+  message and shown as thumbnails in the bubble; `auto` scheduling routes image
+  requests only to providers flagged multimodal.
 - **Theme-aware** — bubble / avatar / time colors follow the dark / light theme; the chat
   canvas is transparent so theme switches apply instantly with no one-frame lag, and a thin
   (6px) scrollbar keeps it unobtrusive.

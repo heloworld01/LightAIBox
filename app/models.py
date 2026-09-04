@@ -16,6 +16,7 @@ class Provider:
     model: str = ""
     enabled: bool = True
     sort_order: int = 0  # 列表顺序即调度优先级（越小越靠前）
+    multimodal: bool = False  # 是否支持多模态（图片）请求；auto 调度时多模态请求只路由到此处为 True 的 provider
     # 输入门槛：仅自适应调度（不指定模型）时，输入字符数 >= 该值才调用此 provider
     min_input_tokens: int = 0
     # 配额

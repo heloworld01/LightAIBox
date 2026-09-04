@@ -119,7 +119,11 @@ class ProviderDialog(QDialog):
         hl.addStretch()
         self._dlg_close_btn = QPushButton("✕")
         self._dlg_close_btn.setProperty("class", "ghost")
-        self._dlg_close_btn.setFixedSize(24, 24)
+        self._dlg_close_btn.setFixedSize(28, 28)
+        # ghost 样式 padding 为文字按钮设计（6px 10px），固定 28px 下会把 ✕
+        # 挤出可视区；这里清零内边距并居中，保证符号完整展示。
+        self._dlg_close_btn.setStyleSheet(
+            "QPushButton { padding: 0px; border-radius: 6px; }")
         self._dlg_close_btn.setToolTip(tr("关闭", "Close"))
         self._dlg_close_btn.clicked.connect(self.close)
         hl.addWidget(self._dlg_close_btn)
@@ -154,17 +158,20 @@ class ProviderDialog(QDialog):
         self.model_edit.setPlaceholderText("例如 gpt-4o / claude-sonnet-5")
         form.addRow(tr("模型 *", "Model *"), self.model_edit)
 
+        # 多模态开关：auto 调度时多模态请求只路由到勾选此处的 provider
+        self.multimodal_check = QCheckBox(tr("支持多模态（图片）", "Supports multimodal (images)"))
+        self.multimodal_check.setToolTip(tr(
+            "多模态请求（含图片）在自适应调度下只会路由到勾选了此选项的 provider",
+            "Under adaptive scheduling, multimodal (image) requests are routed "
+            "only to providers with this option enabled"))
+        form.addRow(tr("多模态", "Multimodal"), self.multimodal_check)
+
         # 最小输入 token 门槛：仅自适应调度（不指定模型）时，输入字符数达到该值才调用
         self.min_input_spin = QSpinBox()
         self.min_input_spin.setRange(0, 2_147_483_647)
         self.min_input_spin.setSpecialValueText(tr("0（不限制）", "0 (unlimited)"))
         self.min_input_spin.setSuffix(tr(" 字符", " chars"))
         form.addRow(tr("最小输入 token", "Min input tokens"), self.min_input_spin)
-
-        # 启用开关
-        self.enabled_check = QCheckBox(tr("启用该 Provider", "Enable this provider"))
-        self.enabled_check.setChecked(True)
-        form.addRow(tr("状态", "Status"), self.enabled_check)
 
         # 配额类型
         self.quota_combo = QComboBox()
@@ -199,8 +206,8 @@ class ProviderDialog(QDialog):
         self.base_url_edit.setText(p.base_url)
         self.api_key_edit.setText(p.api_key)
         self.model_edit.setText(p.model)
+        self.multimodal_check.setChecked(p.multimodal)
         self.min_input_spin.setValue(p.min_input_tokens)
-        self.enabled_check.setChecked(p.enabled)
         idx = self.quota_combo.findData(p.quota_type)
         if idx >= 0:
             self.quota_combo.setCurrentIndex(idx)
@@ -252,13 +259,17 @@ class ProviderDialog(QDialog):
         quota_type = self.quota_combo.currentData()
         quota_limit = self.quota_spin.value() if quota_type != config.QUOTA_UNLIMITED else 0
 
+        # 启用状态不在本对话框编辑：新增默认启用，编辑保留原值，
+        # 开/关统一由列表行右侧的「启用/停用」按钮控制。
+        enabled = self._provider.enabled if self._provider is not None else True
         p = Provider(
             name=name,
             api_type=self.api_type_combo.currentData(),
             base_url=self.base_url_edit.text().strip(),
             api_key=api_key,
             model=model,
-            enabled=self.enabled_check.isChecked(),
+            enabled=enabled,
+            multimodal=self.multimodal_check.isChecked(),
             min_input_tokens=self.min_input_spin.value(),
             quota_type=quota_type,
             quota_limit=quota_limit,
@@ -699,6 +710,9 @@ class GatewayPage(QWidget):
                 type_text = tr("兼容", "Both")
             else:
                 type_text = "OpenAI"
+            # 多模态标记：协议文本后追加 🖼，一眼可辨支持图片请求的 provider
+            if p.multimodal:
+                type_text += " · 🖼"
             self.provider_table.setItem(r, 1, QTableWidgetItem(type_text))
             self.provider_table.setItem(r, 2, QTableWidgetItem(p.model))
 

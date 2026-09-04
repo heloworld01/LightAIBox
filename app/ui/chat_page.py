@@ -10,6 +10,7 @@ UI 采用「气泡」式消息流：用户消息右对齐（主色），助手�
 跟随暗/亮主题切换。后续接入桌面 Agent 工具循环时，工具块可作为气泡内的嵌套结构
 扩展。
 """
+import base64 as _base64
 import html as _html
 import json as _json
 import os as _os
@@ -25,6 +26,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -208,6 +210,8 @@ class ChatPage(QWidget):
         self._think_open: dict = {}
         # 流式中正在累积的思考内容
         self._pending_thinking: list = []
+        # 待发送的图片（data URL 列表）：用户点「图片」按钮加入，随下一条消息发出
+        self._pending_images: list = []
         # 底部瞬时提示（调用失败 / 已停止），随消息流一起注入视图底部
         self._notice_html: str = ""
         # WebView 页面（含 MathJax）是否已加载完成；加载前不注入，避免
@@ -328,6 +332,15 @@ class ChatPage(QWidget):
 
         foot = QHBoxLayout()
         foot.setSpacing(8)
+        # 图片上传按钮：选择本地图片，读成 base64 data URL 暂存，随下次发送一并提交
+        self.image_btn = QPushButton(self.tr("🖼 图片", "🖼 Image"))
+        self.image_btn.setProperty("class", "ghost")
+        self.image_btn.setToolTip(self.tr(
+            "添加图片（多模态对话），图片随下一条消息一并发送",
+            "Add an image (multimodal), sent with the next message"))
+        self.image_btn.clicked.connect(self._on_add_image)
+        foot.addWidget(self.image_btn)
+
         self.hint_label = QLabel(self.tr("Enter 换行 · Ctrl+Enter 发送",
                                          "Enter new line · Ctrl+Enter send"))
         self.hint_label.setProperty("class", "stats-text")
@@ -529,10 +542,41 @@ class ChatPage(QWidget):
         tail = tail.replace("{bg}", bubble_bg)
         return f'<div style="{style}">{tail}</div>'
 
+    def _split_content(self, content) -> tuple:
+        """把消息 content 规整为 (text, images)。
+
+        字符串 content → 纯文本、无图；块列表 content 抽取 text 块的文本与
+        image_url / image 块的 data URL。用于气泡渲染（与模型透传的口径一致）。
+        """
+        if isinstance(content, str):
+            return content, []
+        text_parts: list = []
+        images: list = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text":
+                text_parts.append(b.get("text", ""))
+            elif bt in ("image_url", "input_image"):
+                inner = b.get("image_url") or b.get("input_image") or {}
+                url = inner.get("url", "") if isinstance(inner, dict) else ""
+                if url:
+                    images.append(url)
+            elif bt == "image":
+                src = b.get("source") or {}
+                if isinstance(src, dict):
+                    data = src.get("data", "")
+                    if data:
+                        # Anthropic 的 base64 裸数据：拼成 data URL 供 <img> 展示
+                        mtype = src.get("media_type", "image/png")
+                        images.append(f"data:{mtype};base64,{data}")
+        return "".join(text_parts), images
+
     def _render_block(self, role: str, text: str, meta: str = "",
                       font_size: int = 13, msg_index: int | None = None,
                       show_time: bool = False, mtime: float | None = None,
-                      thinking: str = "") -> str:
+                      thinking: str = "", images: list | None = None) -> str:
         """把一条消息渲染为微信式气泡（圆形头像 + 带头尾气泡）。
 
         布局（flex）：assistant 头像在左、气泡在右；user 头像在右、气泡在左。
@@ -574,6 +618,13 @@ class ChatPage(QWidget):
                          f'margin-top:4px;">{sep.join(bits)}</div>')
         else:
             body = _html.escape(text).replace("\n", "<br>")
+            # 用户消息携带的图片：以缩略图形式内联展示（base64 data URL，无需额外资源）
+            if images:
+                imgs = "".join(
+                    f'<img src="{i}" style="max-width:220px;max-height:220px;'
+                    f'border-radius:8px;display:block;margin:6px 0;" />'
+                    for i in images)
+                body = imgs + body
 
         # 气泡统一带 .bubble 类（供 chat.html 归零首尾块级边距）；原文视图再加
         # no-mathjax 类：MathJax 的 ignoreHtmlClass 会跳过它，否则原文里的
@@ -704,8 +755,9 @@ class ChatPage(QWidget):
         last_ts: float | None = None
         for i, m in enumerate(self.session.messages):
             role = m.get("role", _ROLE_USER)
-            text = m.get("content", "")
-            if isinstance(text, str) and text:
+            content = m.get("content", "")
+            text, images = self._split_content(content)
+            if text or images:
                 # 助手消息携带其统计（存于消息内嵌字段，若存在）；索引用于切换链接
                 meta = m.get("_meta", "")
                 thinking = m.get("_thinking", "")
@@ -717,7 +769,8 @@ class ChatPage(QWidget):
                     last_ts = ts
                 parts.append(self._render_block(
                     role, text, meta, self._font_size, i,
-                    show_time=show_time, mtime=ts, thinking=thinking))
+                    show_time=show_time, mtime=ts, thinking=thinking,
+                    images=images))
         if self._pending_assistant:
             # 流式中：整条视为「新的一段时间」，仅在最新一条之后显示时间
             now = _time.time()
@@ -855,10 +908,12 @@ class ChatPage(QWidget):
     @Slot()
     def _on_send(self):
         text = self.input.toPlainText().strip()
-        if not text or self._worker is not None:
+        images = self._pending_images
+        self._pending_images = []
+        if (not text and not images) or self._worker is not None:
             return
         pid = self._provider_id()
-        self.session.add_user(text)
+        self.session.add_user(text, images=images if images else None)
         self.input.clear()
 
         # 渲染：重建整段（含新增用户气泡），立即生效。用户主动发送：强制贴底
@@ -877,6 +932,41 @@ class ChatPage(QWidget):
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
+
+    @Slot()
+    def _on_add_image(self):
+        """选择本地图片，读成 base64 data URL 暂存，随下一条消息一并发送。
+
+        选中的图片仅存于内存（_pending_images），不立即发送；用户可继续输入文字，
+        点「发送」后图片与文字一起作为一条多模态消息发出。发送或清空后即时清空。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, self.tr("选择图片", "Select images"), "",
+            self.tr("图片文件 (*.png *.jpg *.jpeg *.gif *.webp)", "Images (*.png *.jpg *.jpeg *.gif *.webp)"))
+        if not paths:
+            return
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                # 依据扩展名推断 MIME（data URL 需要），缺省按 png
+                ext = _os.path.splitext(path)[1].lower().lstrip(".")
+                mime = {
+                    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "gif": "image/gif", "webp": "image/webp",
+                }.get(ext, "image/png")
+                url = f"data:{mime};base64," + _base64.b64encode(raw).decode("ascii")
+                self._pending_images.append(url)
+            except OSError:
+                continue
+        self._update_image_btn()
+
+    def _update_image_btn(self):
+        """图片按钮文案反映当前待发送图片数量。"""
+        n = len(self._pending_images)
+        self.image_btn.setText(
+            self.tr(f"🖼 图片 ({n})", f"🖼 Image ({n})") if n
+            else self.tr("🖼 图片", "🖼 Image"))
 
     @Slot(str)
     def _on_token(self, piece: str):
@@ -998,8 +1088,10 @@ class ChatPage(QWidget):
         self.session.clear()
         self._pending_assistant = []
         self._pending_thinking = []
+        self._pending_images = []
         self._think_open = {}
         self._notice_html = ""
+        self._update_image_btn()
         self._reset_history_view(force=True)
 
     def _set_busy(self, busy: bool):
@@ -1029,6 +1121,7 @@ class ChatPage(QWidget):
         self.stop_btn.setText(self.tr("停止", "Stop"))
         self.clear_btn.setText(self.tr("清空", "Clear"))
         self._update_think_btn_text()
+        self._update_image_btn()
         # 重放气泡（角色名 / 统计文案随语言/换肤刷新）。属原地重绘，保持滚动位置，
         # 不再每次切主题都把对话弹到最底部。
         self._reset_history_view(stick=False)

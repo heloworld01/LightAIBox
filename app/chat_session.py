@@ -26,9 +26,24 @@ class ChatSession:
     def append(self, message: Message) -> None:
         self._messages.append(message)
 
-    def add_user(self, text: str) -> None:
-        # time 仅用于聊天页展示时间分隔条，不影响传给模型的内容
-        self._messages.append({"role": "user", "content": text,
+    def add_user(self, text: str, images: Optional[List[str]] = None) -> None:
+        """追加一条用户消息。images 为图片 data URL 列表（可选）。
+
+        带图片时 content 用 OpenAI 风格块列表承载：text 块 + 若干 image_url 块，
+        与 gateway/client 的多模态透传口径一致；纯文本时仍存字符串（兼容旧路径）。
+        time 仅用于聊天页展示时间分隔条，不影响传给模型的内容。
+        """
+        if images:
+            blocks: List[dict] = []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for url in images:
+                blocks.append({"type": "image_url",
+                               "image_url": {"url": url}})
+            content: object = blocks
+        else:
+            content = text
+        self._messages.append({"role": "user", "content": content,
                                "time": time.time()})
 
     def add_assistant(self, text: str) -> None:

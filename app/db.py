@@ -32,6 +32,7 @@ def init_db() -> None:
                 model TEXT NOT NULL DEFAULT '',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 sort_order INTEGER NOT NULL DEFAULT 0,
+                multimodal INTEGER NOT NULL DEFAULT 0,
                 min_input_tokens INTEGER NOT NULL DEFAULT 0,
                 quota_type TEXT NOT NULL DEFAULT 'unlimited',
                 quota_limit INTEGER NOT NULL DEFAULT 0,
@@ -77,6 +78,11 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE providers ADD COLUMN min_input_tokens "
                 "INTEGER NOT NULL DEFAULT 0")
+        # 迁移：补充 multimodal 列（是否支持多模态请求）
+        if "multimodal" not in cols:
+            conn.execute(
+                "ALTER TABLE providers ADD COLUMN multimodal "
+                "INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
 
@@ -94,6 +100,7 @@ def _provider_from_row(row: sqlite3.Row) -> Provider:
         model=row["model"],
         enabled=bool(row["enabled"]),
         sort_order=row["sort_order"],
+        multimodal=bool(row["multimodal"]),
         min_input_tokens=row["min_input_tokens"],
         quota_type=row["quota_type"],
         quota_limit=row["quota_limit"],
@@ -128,16 +135,16 @@ class ProviderStore:
                     """
                     INSERT INTO providers
                         (name, api_type, base_url, api_key, model, enabled,
-                         sort_order, min_input_tokens, quota_type, quota_limit,
-                         used_calls, used_tokens, last_tokens_per_sec,
+                         sort_order, multimodal, min_input_tokens, quota_type,
+                         quota_limit, used_calls, used_tokens, last_tokens_per_sec,
                          last_call_at, auto_disabled, disable_reason)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (p.name, p.api_type, p.base_url, p.api_key, p.model,
-                     int(p.enabled), p.sort_order, p.min_input_tokens,
-                     p.quota_type, p.quota_limit, p.used_calls, p.used_tokens,
-                     p.last_tokens_per_sec, p.last_call_at,
-                     int(p.auto_disabled), p.disable_reason),
+                     int(p.enabled), p.sort_order, int(p.multimodal),
+                     p.min_input_tokens, p.quota_type, p.quota_limit,
+                     p.used_calls, p.used_tokens, p.last_tokens_per_sec,
+                     p.last_call_at, int(p.auto_disabled), p.disable_reason),
                 )
                 p.id = cur.lastrowid
             else:
@@ -145,17 +152,17 @@ class ProviderStore:
                     """
                     UPDATE providers SET
                         name=?, api_type=?, base_url=?, api_key=?, model=?,
-                        enabled=?, sort_order=?, min_input_tokens=?,
+                        enabled=?, sort_order=?, multimodal=?, min_input_tokens=?,
                         quota_type=?, quota_limit=?, used_calls=?,
                         used_tokens=?, last_tokens_per_sec=?, last_call_at=?,
                         auto_disabled=?, disable_reason=?
                     WHERE id=?
                     """,
                     (p.name, p.api_type, p.base_url, p.api_key, p.model,
-                     int(p.enabled), p.sort_order, p.min_input_tokens,
-                     p.quota_type, p.quota_limit, p.used_calls, p.used_tokens,
-                     p.last_tokens_per_sec, p.last_call_at,
-                     int(p.auto_disabled), p.disable_reason, p.id),
+                     int(p.enabled), p.sort_order, int(p.multimodal),
+                     p.min_input_tokens, p.quota_type, p.quota_limit,
+                     p.used_calls, p.used_tokens, p.last_tokens_per_sec,
+                     p.last_call_at, int(p.auto_disabled), p.disable_reason, p.id),
                 )
             conn.commit()
         return p.id

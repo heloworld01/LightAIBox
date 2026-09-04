@@ -21,6 +21,9 @@ from .models import CallLog, ClientResult, Provider
 # auto 容灾：连续失败该次数后才自动关闭 provider（避免单次网络抖动/偶发 5xx
 # 就把正常 provider 永久停用）。计数为进程内状态，成功调用即清零。
 _AUTO_DISABLE_FAILURES = 3
+# 多模态降级阈值：用户配置了支持多模态、但图片请求连续失败该次数后，
+# 系统判定其实不支持图片，自动撤销其多模态标记（保留启用，仅不再路由图片请求）。
+_MM_DOWNGRADE_FAILURES = 2
 
 
 class GatewayError(Exception):
@@ -58,6 +61,23 @@ def _log(store: db.CallLogStore, provider_id: int, model: str,
     ))
 
 
+# 图片块类型识别：OpenAI 用 image_url / input_image，Anthropic 用 image。
+# 任一消息的 content 为块列表且含这些类型，即视为多模态请求。
+_IMAGE_BLOCK_TYPES = {"image", "image_url", "input_image"}
+
+
+def _is_multimodal_request(messages: List[Message]) -> bool:
+    """判断请求是否含图片（多模态）。content 为块列表时检查块类型。"""
+    for m in messages:
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        if any(isinstance(b, dict) and b.get("type") in _IMAGE_BLOCK_TYPES
+               for b in content):
+            return True
+    return False
+
+
 class Gateway:
     def __init__(self, provider_store: Optional[db.ProviderStore] = None,
                  log_store: Optional[db.CallLogStore] = None):
@@ -67,6 +87,9 @@ class Gateway:
         # auto 容灾的进程内连续失败计数：provider_id -> 连续失败次数。成功调用清零，
         # 用户手动启用/停用也不会重置（失败计数只在调用结果里增减）。
         self._fail_counts: Dict[int, int] = {}
+        # 多模态降级的进程内连续「图片请求失败」计数：provider_id -> 次数。
+        # 与通用失败计数分开：只有多模态请求失败才累计，用于撤销误标的多模态能力。
+        self._mm_fail_counts: Dict[int, int] = {}
 
     # ------------------------------------------------------------------ #
     # 调度
@@ -79,12 +102,15 @@ class Gateway:
     def _candidates(self, messages: List[Message],
                     model: Optional[str] = None,
                     api_type: Optional[str] = None,
-                    provider_id: Optional[int] = None) -> List[Provider]:
+                    provider_id: Optional[int] = None,
+                    require_multimodal: bool = False) -> List[Provider]:
         """按当前策略对可用 provider 排序，返回有序候选列表（用于逐个重试）。
 
         指定 model 时，进一步只保留模型名匹配的 provider；匹配不到则抛错。
         指定 provider_id 时，直接锁定该 provider（精确选择，跳过调度）。
         指定 api_type 时，只保留该协议的 provider（统一 API 按调用协议适配）。
+        require_multimodal 为 True 时，只保留支持多模态的 provider；过滤后为空
+        则抛错（auto 调度多模态请求不降级到文本模型）。
         """
         prompt_len = sum(len(str(m.get("content", ""))) for m in messages)
         pool = [p for p in self.providers.list() if p.is_available()]
@@ -99,6 +125,11 @@ class Gateway:
             # 限协议类型：匹配该协议或兼容型（兼容型可用于任一协议）
             pool = [p for p in pool
                     if p.api_type in (api_type, config.API_BOTH)]
+        if require_multimodal:
+            # 多模态请求：过滤掉不支持图片的 provider，空则报错（不降级文本模型）
+            pool = [p for p in pool if p.multimodal]
+            if not pool:
+                raise GatewayError("没有可用的多模态 provider（请启用支持图片的 provider）")
         # 输入门槛：仅自适应调度（未指定 model）时，过滤输入字符数低于阈值的 provider
         if model is None:
             pool = [p for p in pool if prompt_len >= p.min_input_tokens]
@@ -159,6 +190,8 @@ class Gateway:
         _log(self.logs, p.id, p.model, result, "success", "", now)
         # 调用成功即清零该 provider 的连续失败计数（下一次失败从 0 重新累计）
         self._fail_counts.pop(p.id, None)
+        # 图片请求成功证明其确实支持多模态，清零降级计数
+        self._mm_fail_counts.pop(p.id, None)
 
     def _record_failure(self, p: Provider) -> bool:
         """累计一次失败，返回是否已达到「连续失败阈值」从而应自动关闭。
@@ -180,6 +213,23 @@ class Gateway:
         key = p.id if p.id is not None else id(p)
         self._fail_counts.pop(key, None)
 
+    def _record_multimodal_failure(self, p: Provider) -> bool:
+        """累计一次「图片请求失败」，返回是否应撤销其多模态标记。
+
+        用户手动配置了支持多模态、但实际发图就报错——典型是该模型并不具备视觉能力。
+        单次失败可能是网络抖动，故用独立的小阈值；一旦达标即判定其实不支持多模态。
+        """
+        if not p.multimodal or p.id is None:
+            return False
+        self._mm_fail_counts[p.id] = self._mm_fail_counts.get(p.id, 0) + 1
+        return self._mm_fail_counts[p.id] >= _MM_DOWNGRADE_FAILURES
+
+    def _downgrade_multimodal(self, p: Provider) -> None:
+        """撤销 provider 的多模态标记（保留启用状态），持久化使其不再被图片请求路由到。"""
+        p.multimodal = False
+        self.providers.upsert(p)
+        self._mm_fail_counts.pop(p.id, None)
+
     # ------------------------------------------------------------------ #
     # 调用
     # ------------------------------------------------------------------ #
@@ -197,8 +247,11 @@ class Gateway:
         失败抛 GatewayError。
         """
         self.policy = policy or self.policy
+        # 多模态请求：auto 调度下要求路由到支持图片的 provider
+        need_mm = _is_multimodal_request(messages)
         candidates = self._candidates(
-            messages, model=model, api_type=api_type, provider_id=provider_id)
+            messages, model=model, api_type=api_type, provider_id=provider_id,
+            require_multimodal=need_mm)
 
         last_err: Optional[ChatError] = None
         for p in candidates:
@@ -210,6 +263,10 @@ class Gateway:
             except Exception as exc:  # 调度其它 provider 时吞掉单点失败
                 err = exc if isinstance(exc, ChatError) else ChatError(str(exc), p.id)
                 _log(self.logs, p.id, p.model, None, "error", str(err), now)
+                # 多模态请求失败：若该 provider 标称支持多模态却发图就错，
+                # 累计后撤销其多模态标记（与通用停用相互独立）。
+                if need_mm and self._record_multimodal_failure(p):
+                    self._downgrade_multimodal(p)
                 # auto 模式容灾：仅当连续失败达到阈值才自动关闭 provider，
                 # 单次抖动/偶发错误不永久停用，只触发本次降级到下一个候选。
                 if model is None and self._record_failure(p):
@@ -237,8 +294,10 @@ class Gateway:
         若首选的 provider 在流式过程中失败，同样降级到下一个候选重试。
         """
         self.policy = policy or self.policy
+        need_mm = _is_multimodal_request(messages)
         candidates = self._candidates(
-            messages, model=model, api_type=api_type, provider_id=provider_id)
+            messages, model=model, api_type=api_type, provider_id=provider_id,
+            require_multimodal=need_mm)
 
         last_err: Optional[ChatError] = None
         for p in candidates:
@@ -251,6 +310,9 @@ class Gateway:
             except Exception as exc:
                 err = exc if isinstance(exc, ChatError) else ChatError(str(exc), p.id)
                 _log(self.logs, p.id, p.model, None, "error", str(err), now)
+                # 多模态请求失败：累计后撤销标称支持多模态 provider 的标记
+                if need_mm and self._record_multimodal_failure(p):
+                    self._downgrade_multimodal(p)
                 # auto 模式容灾：仅当连续失败达到阈值才自动关闭，单次失败只降级重试
                 if model is None and self._record_failure(p):
                     self._disable_provider(p, "error")
