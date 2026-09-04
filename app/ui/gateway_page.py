@@ -653,6 +653,22 @@ class GatewayPage(QWidget):
         pid = self.provider_table.item(row, 0).data(Qt.UserRole)
         return self.gateway.providers.get(pid)
 
+    def _auto_disabled_tip(self, p) -> str:
+        """自动关闭 provider 的名称列悬停说明：原因 + 如何恢复。"""
+        tr = self.tr
+        if p.disable_reason == "quota":
+            reason = tr("已超出配额额度", "quota limit reached")
+        elif p.disable_reason == "error":
+            reason = tr("连续调用失败（连接异常）", "repeated call failures (connection error)")
+        else:
+            reason = tr("未知原因", "unknown reason")
+        return tr(
+            f"该 Provider 已被程序自动停用（{reason}）。\n"
+            "点击右侧「启用」按钮可重新启用；若配置有误请先编辑修正，避免再次被自动停用。",
+            f"This provider was auto-disabled ({reason}).\n"
+            "Click \"Enable\" on the right to re-enable it; fix its config first "
+            "if needed to avoid being auto-disabled again.")
+
     def refresh_providers(self):
         """同步刷新 provider 列表（用户主动操作后立即调用）。"""
         self._render_providers(self.gateway.providers.list())
@@ -670,6 +686,12 @@ class GatewayPage(QWidget):
         for r, p in enumerate(providers):
             name_item = QTableWidgetItem(p.name)
             name_item.setData(Qt.UserRole, p.id)
+            # provider 被程序自动关闭时，名称前加醒目标记（⚠），并在悬停气泡里
+            # 说明原因与「如何恢复」，避免用户在不知情下发现 provider「消失/不再被调度」。
+            if p.auto_disabled:
+                name_item.setText("⚠ " + p.name)
+                name_item.setForeground(Qt.GlobalColor.red)
+                name_item.setToolTip(self._auto_disabled_tip(p))
             self.provider_table.setItem(r, 0, name_item)
             if p.api_type == config.API_ANTHROPIC:
                 type_text = "Anthropic"

@@ -12,11 +12,15 @@
 调用成功/失败后更新 provider 用量、最近速度，超配额自动关闭；写入 call_logs。
 """
 import datetime
-from typing import Generator, List, Optional
+from typing import Dict, Generator, List, Optional
 
 from . import config, db
 from .client import ChatError, Message, create_client
 from .models import CallLog, ClientResult, Provider
+
+# auto 容灾：连续失败该次数后才自动关闭 provider（避免单次网络抖动/偶发 5xx
+# 就把正常 provider 永久停用）。计数为进程内状态，成功调用即清零。
+_AUTO_DISABLE_FAILURES = 3
 
 
 class GatewayError(Exception):
@@ -60,6 +64,9 @@ class Gateway:
         self.providers = provider_store or db.ProviderStore()
         self.logs = log_store or db.CallLogStore()
         self.policy = config.POLICY_LONG_FIRST
+        # auto 容灾的进程内连续失败计数：provider_id -> 连续失败次数。成功调用清零，
+        # 用户手动启用/停用也不会重置（失败计数只在调用结果里增减）。
+        self._fail_counts: Dict[int, int] = {}
 
     # ------------------------------------------------------------------ #
     # 调度
@@ -150,13 +157,28 @@ class Gateway:
                        tokens_per_sec=result.tokens_per_sec, call_at=now)
         self.providers.upsert(p)
         _log(self.logs, p.id, p.model, result, "success", "", now)
+        # 调用成功即清零该 provider 的连续失败计数（下一次失败从 0 重新累计）
+        self._fail_counts.pop(p.id, None)
+
+    def _record_failure(self, p: Provider) -> bool:
+        """累计一次失败，返回是否已达到「连续失败阈值」从而应自动关闭。
+
+        auto 容灾不再单次失败即关闭：网络抖动、偶发 5xx / 上游限流等瞬时错误
+        不应把一个正常 provider 永久停用。只有当同一 provider 连续失败达到
+        _AUTO_DISABLE_FAILURES 次才触发自动关闭。任何一次成功调用都会清零计数。
+        """
+        key = p.id if p.id is not None else id(p)
+        self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
+        return self._fail_counts[key] >= _AUTO_DISABLE_FAILURES
 
     def _disable_provider(self, p: Provider, reason: str = "error") -> None:
-        """自动关闭 provider（如 auto 容灾时连接异常），持久化使其退出调度。"""
+        """自动关闭 provider（连续失败达阈值时调用），持久化使其退出调度。"""
         p.enabled = False
         p.auto_disabled = True
         p.disable_reason = reason
         self.providers.upsert(p)
+        key = p.id if p.id is not None else id(p)
+        self._fail_counts.pop(key, None)
 
     # ------------------------------------------------------------------ #
     # 调用
@@ -188,8 +210,9 @@ class Gateway:
             except Exception as exc:  # 调度其它 provider 时吞掉单点失败
                 err = exc if isinstance(exc, ChatError) else ChatError(str(exc), p.id)
                 _log(self.logs, p.id, p.model, None, "error", str(err), now)
-                # auto 模式容灾：关闭失败的 provider，重新选择可用接口，减少后续影响
-                if model is None:
+                # auto 模式容灾：仅当连续失败达到阈值才自动关闭 provider，
+                # 单次抖动/偶发错误不永久停用，只触发本次降级到下一个候选。
+                if model is None and self._record_failure(p):
                     self._disable_provider(p, "error")
                 last_err = err
                 continue
@@ -228,8 +251,8 @@ class Gateway:
             except Exception as exc:
                 err = exc if isinstance(exc, ChatError) else ChatError(str(exc), p.id)
                 _log(self.logs, p.id, p.model, None, "error", str(err), now)
-                # auto 模式容灾：关闭失败的 provider，重新选择可用接口
-                if model is None:
+                # auto 模式容灾：仅当连续失败达到阈值才自动关闭，单次失败只降级重试
+                if model is None and self._record_failure(p):
                     self._disable_provider(p, "error")
                 last_err = err
                 continue
