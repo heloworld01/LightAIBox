@@ -13,7 +13,7 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 - **Unified API proxy** — a single `chat` / `chat_stream` interface hides the OpenAI / Anthropic protocol differences. Call a specific model, or leave it unset to auto-select a provider by policy.
 - **Claude Code ready** — the Anthropic-compatible endpoint fully passes through `tools` and multi-turn `tool_result`, with spec-compliant streaming `tool_use` events, so it can drive Claude Code's multi-step agent loop directly.
 - **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, collapsible **thinking** display, **image uploads for multimodal chats**, an optional **agent mode** that runs a LightAgents SuperAgent orchestration loop (intent routing + tool discovery + streaming) with built-in desktop tools and **sandboxed file generation** (docx / xlsx), and time separators (see [Built-in Chat](#built-in-chat)).
-- **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model, multimodal flag), with background connectivity testing that never blocks the UI.
+- **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model, multimodal flag), plus **JSON import / export** of the whole provider list for backup or sharing, with background connectivity testing that never blocks the UI.
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure. Image requests route only to providers flagged as multimodal (a clear error instead of silently dropping images); mislabeled providers get the flag auto-revoked after repeated image failures.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
 - **Call logging & stats** — SQLite-persisted records of tokens, latency, speed, and status per call, filterable by date / provider, with aggregated statistics.
@@ -47,14 +47,16 @@ Linux, `~/Library/Application Support/LightAIBox/` on macOS).
 
 ### Add a provider
 
-Click **Add** in the provider list and fill in the name (unique), protocol type, base URL (the trailing `/v1` is optional), API key, model, and optionally tick **multimodal (images)**. Enable / disable is controlled only by the row button (the edit dialog never changes it). Then use the row buttons to edit / copy / delete / reset quota / test connectivity.
+Click **Add** in the provider list and fill in the name (unique), protocol type, base URL (the trailing `/v1` is optional), API key, model, and optionally tick **multimodal (images)**. Enable / disable is controlled only by the row button (the edit dialog never changes it). Then use the row buttons to edit / copy / delete / reset quota / test connectivity. Use **Import / Export** to replace or back up the whole provider list as JSON.
 
 ## Unified API (HTTP)
 
-A local HTTP server exposes the gateway to external tools (curl / OpenAI SDK / Anthropic SDK / Claude Code) and **auto-starts with the app**, so it works out of the box on `127.0.0.1:8765`.
+A local HTTP server exposes the gateway to external tools (curl / OpenAI SDK / Anthropic SDK / Claude Code) and **auto-starts with the app**, so it works out of the box on `127.0.0.1:8765` (the listen **address** and **port** are remembered across restarts and can be changed on the 统一 API page).
 
 - OpenAI-compatible: `POST /v1/chat/completions`, `GET /v1/models`
 - Anthropic-compatible: `POST /v1/messages`
+
+> **LAN access**: on the 统一 API page, switch the **listen address** to `0.0.0.0` (all interfaces) to let other machines on your network reach it — the page then shows your current LAN IP to use in place of `127.0.0.1`. ⚠️ The server is currently **unauthenticated**: binding to `0.0.0.0` exposes a proxy that draws on your configured provider keys to anything that can reach the port, so only open it on a trusted network.
 
 ```bash
 curl -s http://127.0.0.1:8765/v1/chat/completions \
