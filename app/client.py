@@ -105,7 +105,25 @@ class OpenAIClient(BaseClient):
         prompt_tokens = usage.prompt_tokens if usage else 0
         completion_tokens = usage.completion_tokens if usage else 0
         total_tokens = prompt_tokens + completion_tokens
-        content = resp.choices[0].message.content or "" if resp.choices else ""
+        msg = resp.choices[0].message if resp.choices else None
+        content = (msg.content or "") if msg else ""
+        blocks: List[ContentBlock] = []
+        if content:
+            blocks.append(ContentBlock(type="text", text=content))
+        # OpenAI function calling：把 tool_calls 规整进中性 blocks，供智能体 ReAct 循环读取。
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            fn = getattr(tc, "function", None)
+            import json as _json
+            try:
+                args = _json.loads(getattr(fn, "arguments", "") or "{}")
+            except Exception:
+                args = {}
+            blocks.append(ContentBlock(
+                type="tool_use",
+                tool_name=getattr(fn, "name", "") or "",
+                tool_input=args,
+                tool_id=getattr(tc, "id", "") or "",
+            ))
 
         # token 处理速度（含 prompt，与模型侧计费口径一致）
         tps = total_tokens / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
@@ -115,6 +133,8 @@ class OpenAIClient(BaseClient):
             completion_tokens=completion_tokens,
             elapsed_ms=elapsed_ms,
             tokens_per_sec=tps,
+            blocks=blocks,
+            stop_reason=(getattr(msg, "finish_reason", "") or "") if msg else "",
         )
 
     def ping(self, timeout: float = 15.0) -> int:
@@ -144,6 +164,10 @@ class OpenAIClient(BaseClient):
         )
         chunks: List[str] = []
         usage = None
+        # 带 tools 请求时，把流式 tool_calls 分片按 index 增量拼接成完整调用
+        #（OpenAI 把 id/name/arguments 拆成多帧增量下发），结束回组装进 blocks。
+        import json as _json
+        tool_buf: dict = {}
         for chunk in stream:
             if chunk.usage is not None:
                 usage = chunk.usage
@@ -162,18 +186,47 @@ class OpenAIClient(BaseClient):
             if piece:
                 chunks.append(piece)
                 yield piece
+            # 增量拼接 tool_calls 分片（仅在带 tools 请求时出现）
+            for tc in (getattr(delta, "tool_calls", None) if delta else None) or []:
+                idx = getattr(tc, "index", 0)
+                buf = tool_buf.setdefault(idx, {"id": "", "name": "", "args": []})
+                if getattr(tc, "id", None):
+                    buf["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn:
+                    if getattr(fn, "name", None):
+                        buf["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        buf["args"].append(fn.arguments)
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         prompt_tokens = usage.prompt_tokens if usage else 0
         completion_tokens = usage.completion_tokens if usage else 0
         total_tokens = prompt_tokens + completion_tokens
+        content = "".join(chunks)
+        blocks: List[ContentBlock] = []
+        if content:
+            blocks.append(ContentBlock(type="text", text=content))
+        for idx in sorted(tool_buf):
+            buf = tool_buf[idx]
+            argstr = "".join(buf["args"])
+            try:
+                args = _json.loads(argstr or "{}")
+            except Exception:
+                args = {}
+            blocks.append(ContentBlock(
+                type="tool_use", tool_name=buf["name"],
+                tool_input=args if isinstance(args, dict) else {},
+                tool_id=buf["id"],
+            ))
         tps = total_tokens / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
         return ClientResult(
-            content="".join(chunks),
+            content=content,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             elapsed_ms=elapsed_ms,
             tokens_per_sec=tps,
+            blocks=blocks,
         )
 
 

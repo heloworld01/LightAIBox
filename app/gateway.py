@@ -183,10 +183,23 @@ class Gateway:
 
     def _record_success(self, p: Provider, result: ClientResult,
                         now: str) -> None:
-        """累加用量、更新速度，必要时自动关闭，并写成功日志。"""
-        p.record_usage(calls=1, tokens=result.total_tokens,
-                       tokens_per_sec=result.tokens_per_sec, call_at=now)
-        self.providers.upsert(p)
+        """累加用量、更新速度，必要时自动关闭，并写成功日志。
+
+        用量走 store 的定向 UPDATE（DB 侧累加），不用全字段 upsert 回写——
+        调用持久的快照可能落后于用户期间做的停用 / 排序 / 编辑，全量回写会把
+        这些改动覆盖掉（曾表现为「停用的 provider 被重新启用」「优先级被改回」）。
+        """
+        will_disable = False
+        if p.quota_type != config.QUOTA_UNLIMITED:
+            # 用配额判定所需的最小快照字段做本地预估；DB 侧仍按当前真实值累加
+            if p.quota_type == config.QUOTA_CALLS:
+                will_disable = p.used_calls + 1 >= p.quota_limit
+            elif p.quota_type == config.QUOTA_TOKENS:
+                will_disable = p.used_tokens + result.total_tokens >= p.quota_limit
+        self.providers.record_usage(
+            p.id, calls=1, tokens=result.total_tokens,
+            tokens_per_sec=result.tokens_per_sec, call_at=now,
+            auto_disable=will_disable)
         _log(self.logs, p.id, p.model, result, "success", "", now)
         # 调用成功即清零该 provider 的连续失败计数（下一次失败从 0 重新累计）
         self._fail_counts.pop(p.id, None)
@@ -205,11 +218,11 @@ class Gateway:
         return self._fail_counts[key] >= _AUTO_DISABLE_FAILURES
 
     def _disable_provider(self, p: Provider, reason: str = "error") -> None:
-        """自动关闭 provider（连续失败达阈值时调用），持久化使其退出调度。"""
-        p.enabled = False
-        p.auto_disabled = True
-        p.disable_reason = reason
-        self.providers.upsert(p)
+        """自动关闭 provider（连续失败达阈值时调用），持久化使其退出调度。
+
+        定向 UPDATE 只写关闭字段，不回写快照的其它字段（同 _record_success）。
+        """
+        self.providers.disable_auto(p.id, reason)
         key = p.id if p.id is not None else id(p)
         self._fail_counts.pop(key, None)
 
@@ -225,9 +238,11 @@ class Gateway:
         return self._mm_fail_counts[p.id] >= _MM_DOWNGRADE_FAILURES
 
     def _downgrade_multimodal(self, p: Provider) -> None:
-        """撤销 provider 的多模态标记（保留启用状态），持久化使其不再被图片请求路由到。"""
-        p.multimodal = False
-        self.providers.upsert(p)
+        """撤销 provider 的多模态标记（保留启用状态），持久化使其不再被图片请求路由到。
+
+        定向 UPDATE 只写 multimodal 字段（同 _record_success 的说明）。
+        """
+        self.providers.set_multimodal(p.id, False)
         self._mm_fail_counts.pop(p.id, None)
 
     # ------------------------------------------------------------------ #
@@ -276,6 +291,100 @@ class Gateway:
 
             self._record_success(p, result, now)
             return result
+
+        if last_err is not None:
+            raise GatewayError(f"所有可用 provider 调用失败，最后错误：{last_err}")
+        raise GatewayError("没有可用的 provider")
+
+    def effective_protocol(self, provider_id) -> Optional[str]:
+        """provider 实际使用的请求协议：兼容型(both)按既有约定走 OpenAI。"""
+        try:
+            p = self.providers.get(provider_id)
+        except Exception:
+            return None
+        if p is None:
+            return None
+        at = getattr(p, "api_type", None)
+        return config.API_ANTHROPIC if at == config.API_ANTHROPIC else config.API_OPENAI
+
+    def chat_with_provider(self, messages: List[Message], **kwargs):
+        """同 `chat`，但额外返回实际服务的 provider_id 与请求协议。
+
+        智能体 ReAct 循环用它在多轮工具调用间锁定同一 provider（保持协议一致：
+        OpenAI 的 tool_calls / Anthropic 的 tool_use 块不能跨协议混传）。
+        返回 (ClientResult, provider_id, protocol)。
+        """
+        # 复用 chat 的调度/容灾，但捕获命中的 provider id：把候选选择逻辑收敛到
+        # 一层薄封装——直接委托 chat() 无法拿到 p.id，故这里做一次轻量重实现，
+        # 仅在成功路径记录 id。为降低重复，先取一次候选再逐个尝试。
+        need_mm = _is_multimodal_request(messages)
+        api_type = kwargs.pop("api_type", None)
+        candidates = self._candidates(
+            messages, model=kwargs.get("model"), api_type=api_type,
+            provider_id=kwargs.get("provider_id"), require_multimodal=need_mm)
+        last_err: Optional[ChatError] = None
+        for p in candidates:
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                client = _new_client_if_available(
+                    p, protocol=_client_protocol(p, api_type))
+                fwd = {k: v for k, v in kwargs.items()
+                       if k not in ("model", "policy", "provider_id")}
+                result = client.chat(messages, **fwd)
+            except Exception as exc:
+                err = exc if isinstance(exc, ChatError) else ChatError(str(exc), p.id)
+                _log(self.logs, p.id, p.model, None, "error", str(err), now)
+                if need_mm and self._record_multimodal_failure(p):
+                    self._downgrade_multimodal(p)
+                last_err = err
+                continue
+            self._record_success(p, result, now)
+            proto = _client_protocol(p, api_type) or config.API_OPENAI
+            return result, p.id, proto
+
+        if last_err is not None:
+            raise GatewayError(f"所有可用 provider 调用失败，最后错误：{last_err}")
+        raise GatewayError("没有可用的 provider")
+
+    def chat_with_provider_stream(self, messages: List[Message],
+                                  policy: Optional[str] = None,
+                                  model: Optional[str] = None,
+                                  api_type: Optional[str] = None,
+                                  provider_id: Optional[int] = None,
+                                  **kwargs
+                                  ) -> Generator[str, None, tuple]:
+        """``chat_with_provider`` 的流式版：逐段 yield 文本增量，返回 (result, pid, proto)。
+
+        智能体 ReAct 工具循环用它在多轮工具调用间锁定同一 provider 并拿真实上游
+        流式增量（OpenAI 由 chat_stream 拼接 tool_calls，Anthropic 由 get_final_message
+        带回 tool_use 块）。失败降级到下个候选，全部失败抛 GatewayError。
+        """
+        self.policy = policy or self.policy
+        need_mm = _is_multimodal_request(messages)
+        candidates = self._candidates(
+            messages, model=model, api_type=api_type, provider_id=provider_id,
+            require_multimodal=need_mm)
+        last_err: Optional[ChatError] = None
+        for p in candidates:
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                client = _new_client_if_available(
+                    p, protocol=_client_protocol(p, api_type))
+                fwd = {k: v for k, v in kwargs.items()
+                       if k not in ("model", "policy", "provider_id")}
+                result: ClientResult = yield from client.chat_stream(messages, **fwd)
+            except Exception as exc:
+                err = exc if isinstance(exc, ChatError) else ChatError(str(exc), p.id)
+                _log(self.logs, p.id, p.model, None, "error", str(err), now)
+                if need_mm and self._record_multimodal_failure(p):
+                    self._downgrade_multimodal(p)
+                if model is None and self._record_failure(p):
+                    self._disable_provider(p, "error")
+                last_err = err
+                continue
+            self._record_success(p, result, now)
+            proto = _client_protocol(p, api_type) or config.API_OPENAI
+            return result, p.id, proto
 
         if last_err is not None:
             raise GatewayError(f"所有可用 provider 调用失败，最后错误：{last_err}")

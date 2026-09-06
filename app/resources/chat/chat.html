@@ -55,6 +55,23 @@
     border-radius: 3px;
   }
   ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.65); }
+
+  /* 流式打字光标：生成中在流式气泡末尾闪烁，提示正在进行 */
+  .stream-cursor {
+    display: inline-block;
+    width: 0.55em;
+    height: 1.1em;
+    vertical-align: text-bottom;
+    margin-left: 2px;
+    background: currentColor;
+    border-radius: 1px;
+    opacity: 0.9;
+    animation: stream-blink 0.9s step-start infinite;
+  }
+  @keyframes stream-blink {
+    0%, 50% { opacity: 0.9; }
+    50.01%, 100% { opacity: 0.15; }
+  }
 </style>
 <script>
   // MathJax v3 初始化配置必须在加载 tex-chtml.js 之前生效
@@ -187,6 +204,67 @@
           window.scrollTo(0, Math.min(savedY, Math.max(0, max)));
         }
       });
+  };
+
+  // ------------------------------------------------------------------
+  // 流式增量渲染：只更新「正在生成的最后一条助手气泡」，历史消息不再每次重建，
+  // 数学公式 / mermaid 也只对该气泡重排（避免长会话每次 token 全量重排卡顿）。
+  // ------------------------------------------------------------------
+  var STREAM_ID = 'stream-bubble';
+
+  // 仅对给定节点内的 .mermaid 块渲染（区别于 __renderChat 的全量 _runMermaid）。
+  function _runMermaidIn(node, theme) {
+    return window.__mermaidReady.then(function () {
+      var nodes = node.querySelectorAll('pre.mermaid');
+      if (!nodes.length) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: theme || 'default' });
+        return mermaid.run({ nodes: nodes });
+      } catch (e) { console.warn('mermaid', e); }
+    }).catch(function (e) { console.warn('mermaid', e); });
+  }
+
+  function _streamEl() {
+    return document.getElementById(STREAM_ID);
+  }
+  function _streamEnsure() {
+    var el = _streamEl();
+    if (!el) {
+      el = document.createElement('div');
+      el.id = STREAM_ID;
+      document.getElementById('messages').appendChild(el);
+    }
+    return el;
+  }
+
+  // 初始化：确保流式节点存在（_on_page_loaded / 首屏重放时可安全调用）。
+  window.__streamInit = function () { _streamEnsure(); };
+
+  // 开始流式：显示光标（由 append 时写入），标记正在生成。
+  window.__streamStart = function () { _streamEnsure(); };
+
+  // 追加流式气泡 HTML：只替换流式节点，仅对该节点重排 mermaid + MathJax。
+  //   html          ：单条进行中助手气泡的 HTML（不含光标）
+  //   mermaidTheme  ：'default' / 'dark'
+  //   showCursor    ：是否在末尾追加闪烁光标
+  // 返回后自动按 _pinned 贴底（生成中仅在用户贴底时跟进）。
+  window.__appendStreaming = function (html, mermaidTheme, showCursor) {
+    var el = _streamEnsure();
+    el.innerHTML = html + (showCursor === false ? '' : '<span class="stream-cursor"></span>');
+    window.__mermaidReady
+      .then(function () { return _runMermaidIn(el, mermaidTheme); })
+      .then(function () { return window.__mathJaxReady; })
+      .then(function () { return MathJax.typesetPromise([el]); })
+      .then(function () {
+        if (_pinned) _scrollBottom();
+      })
+      .catch(function () { if (_pinned) _scrollBottom(); });
+  };
+
+  // 结束流式：移除流式节点并复位贴底标志（随后 Python 会以全量 __renderChat 固化整段历史）。
+  window.__streamStop = function () {
+    var el = _streamEl();
+    if (el && el.parentNode) el.parentNode.removeChild(el);
   };
 
   // 「原文/渲染」切换链接拦截。

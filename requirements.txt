@@ -4,3 +4,13 @@ anthropic>=0.40
 fastapi>=0.116
 uvicorn>=0.35
 markdown>=3.4
+# LightAgents 智能体框架（外部源码库 D:\project\LightAgents）所需依赖
+python-dotenv>=0.19
+pydantic>=2.0
+numpy>=2.0
+networkx>=2.6
+tiktoken>=0.5
+pyyaml>=6.0
+# 智能体产出文件：word/excel（app/file_tools.py，结构化生成）
+python-docx>=0.8
+openpyxl>=3.0

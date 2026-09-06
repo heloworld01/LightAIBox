@@ -40,6 +40,20 @@ hiddenimports = collect_submodules("uvicorn") + \
                     "httptools",
                 ]
 
+# 智能体框架 LightAgents（外部源码库 D:\project\LightAgents）：源码运行无需
+# 额外处理；打包后 light_agents 不随包分发，故把外部仓库的 light_agents 作为
+# 数据整体拷入包内（目录名保持 light_agents）。
+_LIGHTAGENTS_DIR = os.path.join(_PROJECT_DIR, "..", "LightAgents", "light_agents")
+_VA_LIGHTAGENTS = os.path.abspath(_LIGHTAGENTS_DIR)
+_vendor_datas = []
+if os.path.isdir(_VA_LIGHTAGENTS):
+    _vendor_datas.append((_VA_LIGHTAGENTS, "light_agents"))
+# 技能目录（<name>/SKILL.md）：让打包态也能发现技能（见 gateway_llm._skills_dir）
+_LIGHTAGENTS_SKILLS = os.path.join(_PROJECT_DIR, "..", "LightAgents", "skills")
+_VA_SKILLS = os.path.abspath(_LIGHTAGENTS_SKILLS)
+if os.path.isdir(_VA_SKILLS):
+    _vendor_datas.append((_VA_SKILLS, "skills"))
+
 a = Analysis(
     ["run.py"],
     pathex=[os.path.abspath(".")],
@@ -47,7 +61,7 @@ a = Analysis(
     datas=[
         # 只读资源（QSS 主题文件）
         ("app/resources", "app/resources"),
-    ],
+    ] + _vendor_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

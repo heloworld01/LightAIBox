@@ -21,7 +21,7 @@ from datetime import datetime as _datetime
 import markdown as _md
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -41,8 +42,10 @@ from ..gateway import Gateway
 from ..chat_session import ChatSession
 from .i18n import LanguageManager
 from .theme_manager import ThemeManager
-from .widgets import SectionHeader
+from .widgets import MessageBox, SectionHeader
+from ..approval import ApprovalCoordinator
 from ..client import THINK_TAG, THINK_END_TAG
+from ..agent_bridge import TOOL_TAG, TOOL_END_TAG
 
 _ROLE_USER = "user"
 _ROLE_ASSISTANT = "assistant"
@@ -84,10 +87,12 @@ def _chat_palette():
 
 
 class _ChatWorker(QThread):
-    """独立线程消费 Gateway.chat_stream，把增量经信号送回主线程。
+    """独立线程消费 Gateway.chat_stream 或智能体会话，把增量经信号送回主线程。
 
     Gateway.chat_stream 在 provider 层是阻塞网络请求，不能放进主线程；
     QThread（run 里同步迭代生成器）是 PySide6 下最直接的隔离方式。
+    智能体模式（agent_mode=True）时改用 AgentChatSession.chat_stream——
+    二者接口一致（yield 文本增量，StopIteration.value 为 ClientResult）。
     """
 
     token = Signal(str)
@@ -95,19 +100,31 @@ class _ChatWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, gateway: Gateway, messages: list,
-                 provider_id=None, thinking_enabled: bool = False, parent=None):
+                 provider_id=None, thinking_enabled: bool = False,
+                 agent_mode: bool = False, approval=None, parent=None):
         super().__init__(parent)
         self._gateway = gateway
         self._messages = messages
         self._provider_id = provider_id
         self._thinking_enabled = thinking_enabled
+        self._agent_mode = agent_mode
+        # 智能体写文件的运行时授权协调器（跑在主线程，跨线程经 Qt 信号弹窗）
+        self._approval = approval
         self._stop = False
 
     def run(self) -> None:
         try:
-            it = self._gateway.chat_stream(
-                self._messages, provider_id=self._provider_id,
-                thinking_enabled=self._thinking_enabled)
+            if self._agent_mode:
+                from ..agent_bridge import AgentChatSession
+                session = AgentChatSession(
+                    self._gateway, provider_id=self._provider_id,
+                    approval=self._approval)
+                it = session.chat_stream(
+                    self._messages, thinking_enabled=self._thinking_enabled)
+            else:
+                it = self._gateway.chat_stream(
+                    self._messages, provider_id=self._provider_id,
+                    thinking_enabled=self._thinking_enabled)
             try:
                 while not self._stop:
                     try:
@@ -206,10 +223,18 @@ class ChatPage(QWidget):
         # 思考模式开关（仅当次会话生效，QSettings 持久化记忆偏好）
         self._thinking_on = self._settings.value(
             "chat/thinking", False, type=bool)
+        # 智能体模式开关（QSettings 持久化记忆偏好）
+        self._agent_on = self._settings.value(
+            "chat/agent", False, type=bool)
         # 每封助手消息的思考内容展开状态：msg_index -> bool（默认折叠）
         self._think_open: dict = {}
         # 流式中正在累积的思考内容
         self._pending_thinking: list = []
+        # 智能体模式：本轮已发生的工具活动（按发生顺序的 (name, kind, ok, args/text)）
+        self._pending_tools: list = []
+        # 智能体写文件的运行时授权：工具线程请求 → 主线程弹确认框 → 写回结果。
+        self._approval = ApprovalCoordinator(self)
+        self._approval.approval_requested.connect(self._on_approval_requested)
         # 待发送的图片（data URL 列表）：用户点「图片」按钮加入，随下一条消息发出
         self._pending_images: list = []
         # 底部瞬时提示（调用失败 / 已停止），随消息流一起注入视图底部
@@ -221,6 +246,7 @@ class ChatPage(QWidget):
 
         self._build_ui()
         self._update_think_btn_text()
+        self._update_agent_btn_text()
         self.refresh_providers()
         # 轮询刷新模型下拉：AI 网关页增删/启停 provider、配额用尽自动关闭等
         # 状态变化不会通知对话页，这里用与 ProvidersBar 相同的定时轮询方式
@@ -267,6 +293,16 @@ class ChatPage(QWidget):
         self.think_btn.setProperty("class", "ghost")
         self.think_btn.clicked.connect(self._on_toggle_thinking)
 
+        # 智能体模式开关：接入 LightAgents 智能体框架问答（可勾选按钮），持久化偏好
+        self.agent_btn = QPushButton()
+        self.agent_btn.setCheckable(True)
+        self.agent_btn.setChecked(self._agent_on)
+        self.agent_btn.setProperty("class", "ghost")
+        self.agent_btn.setToolTip(self.tr(
+            "开启后走 LightAgents 智能体框架（多协议 / 多模态）生成回复",
+            "Route replies through the LightAgents agent framework"))
+        self.agent_btn.clicked.connect(self._on_toggle_agent)
+
         top = QWidget()
         tl = QHBoxLayout(top)
         tl.setContentsMargins(0, 0, 0, 0)
@@ -277,6 +313,7 @@ class ChatPage(QWidget):
         tl.addWidget(self.font_label)
         tl.addWidget(self.font_combo)
         tl.addWidget(self.think_btn)
+        tl.addWidget(self.agent_btn)
         root.addWidget(top)
 
         # 对话记录：QWebEngineView 承载 chat.html（MathJax 渲染公式）。
@@ -308,6 +345,12 @@ class ChatPage(QWidget):
         self._pending_html: str | None = None
         self._pending_stick: bool = True
         self._pending_force_pin: bool = False
+        # 增量流式：只更新「最后一条进行中气泡」的 HTML（走 __appendStreaming）
+        self._pending_stream_html: str | None = None
+        self._pending_stream_cursor: bool = True
+        # 自适应刷盘节奏：按最近 token 到达间隔调整合并窗
+        self._gap_ema: float | None = None
+        self._last_token_ts: float | None = None
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
         self._flush_timer.setInterval(120)
@@ -576,7 +619,8 @@ class ChatPage(QWidget):
     def _render_block(self, role: str, text: str, meta: str = "",
                       font_size: int = 13, msg_index: int | None = None,
                       show_time: bool = False, mtime: float | None = None,
-                      thinking: str = "", images: list | None = None) -> str:
+                      thinking: str = "", images: list | None = None,
+                      tools: list | None = None) -> str:
         """把一条消息渲染为微信式气泡（圆形头像 + 带头尾气泡）。
 
         布局（flex）：assistant 头像在左、气泡在右；user 头像在右、气泡在左。
@@ -600,6 +644,7 @@ class ChatPage(QWidget):
         raw = False
         under = ""
         think_html = ""
+        tools_html = ""
         if role == _ROLE_ASSISTANT:
             raw = msg_index is not None and self._render_raw.get(msg_index, False)
             body = (_html.escape(text).replace("\n", "<br>") if raw
@@ -607,6 +652,9 @@ class ChatPage(QWidget):
             # 思考块：可折叠（默认折叠），标题行可点击展开/关闭
             if thinking:
                 think_html = self._thinking_html(msg_index, thinking, font_size)
+            # 工具活动（智能体模式）：气泡内正文上方的状态行
+            if tools:
+                tools_html = self._tools_html(tools, font_size)
             bits = []
             if meta:
                 bits.append(f'<span>{_html.escape(meta)}</span>')
@@ -634,7 +682,7 @@ class ChatPage(QWidget):
                   f'color:{text_color};'
                   f'border-radius:{radius};padding:8px 12px;max-width:100%;'
                   f'font-size:{font_size}px;line-height:1.5;white-space:normal;">'
-                  f'{think_html}{body}</div>')
+                  f'{tools_html}{think_html}{body}</div>')
 
         bubble_group = self._bubble_group_html(role, bubble, pal, bubble_bg)
 
@@ -699,6 +747,64 @@ class ChatPage(QWidget):
                 f'{_html.escape(label)}</a>'
                 f'{inner}</div>')
 
+    def _tools_html(self, tools: list, font_size: int) -> str:
+        """生成助手气泡内「工具活动」状态行列表（智能体模式）。
+
+        tools 为 (name, kind, ok, args_text) 元组列表：kind=call 表示发起调用、
+        kind=result 表示已返回。流式期间 call 先出现（pending 态），result 到达
+        后合并为完成态；重放时两者成对出现，只渲染完成态行。样式与思考块一致：
+        浅色小字，前缀 🔧 / ✓ / ⚠。
+        """
+        pal = _chat_palette()
+
+        def _open_path(text: str):
+            """从写文件工具的结果文本里抽出绝对路径（'已写入：<path>（大小）'）。"""
+            if "已写入：" in text:
+                seg = text.split("已写入：", 1)[1]
+                return seg.split("（", 1)[0].strip()
+            return None
+
+        # 合并成对事件：name -> [done?, ok?, args, open_path]
+        merged: "dict[str, list]" = {}
+        order: "list[str]" = []
+        for name, kind, ok, detail in tools:
+            if kind == "call":
+                if name not in merged:
+                    merged[name] = [False, True, detail, None]
+                    order.append(name)
+            elif kind == "result":
+                if name in merged:
+                    merged[name][0] = True
+                    merged[name][1] = ok
+                    merged[name][3] = _open_path(detail)
+                else:
+                    merged[name] = [True, ok, "", _open_path(detail)]
+                    order.append(name)
+        rows = []
+        for name in order:
+            done, ok, args_text, open_path = merged[name]
+            icon = ("✓" if ok else "⚠") if done else "…"
+            title = _html.escape(name)
+            if args_text and len(args_text) > 80:
+                args_text = args_text[:80] + "…"
+            detail = f' <span style="color:{pal["meta"]};">{_html.escape(args_text)}</span>' if args_text else ""
+            row = f'<div style="font-size:{font_size - 1}px;' \
+                  f'color:{pal["meta"]};margin:1px 0;">' \
+                  f'🔧 {icon} {title}{detail}'
+            if open_path:
+                import base64 as _b64
+                enc = _b64.urlsafe_b64encode(
+                    open_path.encode("utf-8")).decode("utf-8").rstrip("=")
+                row += (f' <a href="chat:open:{enc}" '
+                        f'style="color:{pal["user_avatar"]};text-decoration:underline;">'
+                        f'🔗 打开：{_html.escape(_os.path.basename(open_path))}</a>')
+            row += "</div>"
+            rows.append(row)
+        if not rows:
+            return ""
+        return ('<div style="margin:2px 0 6px;padding-left:8px;'
+                f'border-left:2px solid {pal["meta"]};">' + "".join(rows) + "</div>")
+
     @Slot(QUrl)
     def _on_anchor_clicked(self, url):
         """处理气泡内切换链接点击，翻转对应消息的显示格式并重放。"""
@@ -710,10 +816,57 @@ class ChatPage(QWidget):
         elif href.startswith("chat:think:"):
             idx = int(href[len("chat:think:"):])
             self._think_open[idx] = not self._think_open.get(idx, False)
+        elif href.startswith("chat:open:"):
+            # 打开智能体产出的文件：href 内是 urlsafe_base64 编码的绝对路径（避免
+            # Windows 反斜杠 / 空格在 URL 中歧义）。打开后用系统默认应用即可，不重绘。
+            b64 = href[len("chat:open:"):]
+            try:
+                import base64 as _b64
+                pad = "=" * ((4 - len(b64) % 4) % 4)
+                raw = _b64.urlsafe_b64decode(b64 + pad)
+                path = raw.decode("utf-8")
+            except Exception:
+                return
+            if _os.path.isfile(path):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            return
         else:
             return
         # 原地重绘：翻转该条显示格式，不应把视图弹到底/改变当前阅读位置
         self._reset_history_view(force=True, stick=False)
+
+    @Slot(object)
+    def _on_approval_requested(self, proposal):
+        """（主线程）智能体要写文件时弹出确认框；把 Yes/No 写回协调器唤醒工具线程。
+
+        proposal：{action, kind, path, display, size}，由工具线程经 approval_requested
+        Signal 跨线程投递。模态弹窗会阻塞主线程事件循环——但工具线程此刻正阻塞在
+        Event.wait() 上，两者互不占用对方，不会死锁。
+        """
+        def _human(n: int) -> str:
+            if n < 1024:
+                return f"{n} 字节"
+            if n < 1024 * 1024:
+                return f"{n / 1024:.1f} KB"
+            return f"{n / 1024 / 1024:.1f} MB"
+
+        kind_map = {"txt": "文本", "docx": "Word 文档", "xlsx": "Excel 表格"}
+        kind = kind_map.get(proposal.get("kind", ""), proposal.get("kind", ""))
+        size_txt = _human(int(proposal.get("size", 0)))
+        title = self.tr("允许写入文件？", "Allow file write?")
+        text = self.tr(
+            "智能体请求生成以下文件：\n\n"
+            "类型：{kind}\n"
+            "文件：{display}\n"
+            "位置：{path}\n"
+            "大小：{size_txt}\n\n"
+            "是否允许写入？",
+            "The agent requests to create:\n\nType: {kind}\nFile: {display}\n"
+            "Location: {path}\nSize: {size_txt}\n\nAllow writing?").format(
+            kind=kind, display=proposal.get("display", ""),
+            path=proposal.get("path", ""), size_txt=size_txt)
+        yes = MessageBox.question(self, title, text) == QMessageBox.Yes
+        self._approval.resolve(proposal, yes)
 
     def _empty_hint_html(self) -> str:
         pal = _chat_palette()
@@ -770,15 +923,12 @@ class ChatPage(QWidget):
                 parts.append(self._render_block(
                     role, text, meta, self._font_size, i,
                     show_time=show_time, mtime=ts, thinking=thinking,
-                    images=images))
+                    images=images, tools=m.get("_tools")))
         if self._pending_assistant:
             # 流式中：整条视为「新的一段时间」，仅在最新一条之后显示时间
             now = _time.time()
             show_time = not parts or (last_ts is None or now - last_ts > 300)
-            parts.append(self._render_block(
-                _ROLE_ASSISTANT, "".join(self._pending_assistant),
-                font_size=self._font_size, show_time=show_time, mtime=now,
-                thinking="".join(self._pending_thinking)))
+            parts.append(self._render_streaming_bubble(show_time=show_time, mtime=now))
         if not parts:
             parts.append(self._empty_hint_html())
         html = "".join(parts) + self._notice_html
@@ -793,8 +943,79 @@ class ChatPage(QWidget):
             self._pending_force_pin = force_pin
             self._flush_timer.start()
 
+    def _render_streaming_bubble(self, show_time: bool = False,
+                                 mtime: float | None = None) -> str:
+        """构建「流式中最后一条助手气泡」的 HTML（不含标题/历史，仅该气泡）。
+
+        增量流式只重建这条气泡；确认的历史消息已渲染在 DOM 里、不再参与每次刷盘。
+        """
+        text = "".join(self._pending_assistant)
+        thinking = "".join(self._pending_thinking)
+        tools = list(self._pending_tools) or None
+        # 正文为空但有思考/工具活动时也要渲染（智能体工具循环阶段能看到状态行）
+        if not (text or thinking or tools):
+            return ""
+        now = mtime if mtime is not None else _time.time()
+        show_time = show_time or not (len(self.session.messages) > 0)
+        return self._render_block(
+            _ROLE_ASSISTANT, text,
+            font_size=self._font_size, show_time=show_time, mtime=now,
+            thinking=thinking, tools=tools)
+
+    def _refresh_streaming(self, show_cursor: bool = True) -> None:
+        """流式增量：只重建并刷入最后一条进行中气泡（受防抖合并）。
+
+        仅当 worker 存在（真在流式）时合并刷盘；worker 已停则直接即时推流式节点
+        （罕见，作为兜底）。
+        """
+        html = self._render_streaming_bubble()
+        if not html:
+            return
+        if self._worker is None:
+            self._pending_stream_html = None
+            self._flush_timer.stop()
+            self._push_streaming(html, show_cursor)
+            return
+        self._pending_stream_html = html
+        self._pending_stream_cursor = show_cursor
+        # 自适应合并窗：token 快速到达（gaps 小）时放宽到 ~180ms 批量合并，
+        # 慢节奏（思考/工具等待的静默缝隙）时收紧到 ~90ms，让画面尽快跟上。
+        now = _time.monotonic()
+        if self._last_token_ts is not None:
+            gap = now - self._last_token_ts
+            self._gap_ema = gap if self._gap_ema is None \
+                else 0.8 * self._gap_ema + 0.2 * gap
+        self._last_token_ts = now
+        ema = self._gap_ema if self._gap_ema is not None else 0.03
+        interval = int(max(90, min(200, 120 + (0.020 - ema) * 4000)))
+        if self._flush_timer.interval() != interval:
+            self._flush_timer.setInterval(interval)
+        self._flush_timer.start()
+
+    def _push_streaming(self, html: str, show_cursor: bool = True) -> None:
+        """经 window.__appendStreaming 只更新流式气泡节点（仅对该节点重排公式/图）。"""
+        if not self._page_ready:
+            return
+        mermaid_theme = ("dark" if ThemeManager().current() == ThemeManager.DARK
+                         else "default")
+        script = "window.__appendStreaming(%s, %s, %s);" % (
+            _json.dumps(html), _json.dumps(mermaid_theme),
+            "true" if show_cursor else "false")
+        self.view.page().runJavaScript(script)
+
+    def _view_stop_streaming(self) -> None:
+        """请求页面移除增量流式节点与光标（结束/停止/清空时调用）。"""
+        if not self._page_ready:
+            return
+        self.view.page().runJavaScript("window.__streamStop && window.__streamStop();")
+
     def _flush_stream(self) -> None:
-        """防抖定时器触发：把攒下的最新 HTML 推给页面。"""
+        """防抖定时器触发：优先刷增量流式节点，否则刷整段历史。"""
+        if self._pending_stream_html is not None:
+            self._push_streaming(self._pending_stream_html,
+                                 self._pending_stream_cursor)
+            self._pending_stream_html = None
+            return
         if self._pending_html is None:
             return
         self._push_html(self._pending_html,
@@ -902,6 +1123,19 @@ class ChatPage(QWidget):
         self._settings.setValue("chat/thinking", self._thinking_on)
         self._update_think_btn_text()
 
+    def _on_toggle_agent(self):
+        """智能体模式开关：持久化偏好并刷新按钮文案。"""
+        self._agent_on = self.agent_btn.isChecked()
+        self._settings.setValue("chat/agent", self._agent_on)
+        self._update_agent_btn_text()
+
+    def _update_agent_btn_text(self):
+        """智能体按钮文案随状态/语言切换。"""
+        if self._agent_on:
+            self.agent_btn.setText(self.tr("智能体：开", "Agent: on"))
+        else:
+            self.agent_btn.setText(self.tr("智能体：关", "Agent: off"))
+
     # ------------------------------------------------------------------ #
     # 发送 / 流式接收
     # ------------------------------------------------------------------ #
@@ -920,6 +1154,7 @@ class ChatPage(QWidget):
         # 并复位跟贴（force_pin），避免此前上翻状态导致新消息也停在旧位置。
         self._pending_assistant = []
         self._pending_thinking = []
+        self._pending_tools = []
         self._last_stats = ""
         self._notice_html = ""
         self._reset_history_view(force=True, force_pin=True)
@@ -927,7 +1162,8 @@ class ChatPage(QWidget):
         self._set_busy(True)
         self._worker = _ChatWorker(
             self.gateway, self.session.to_message_list(),
-            provider_id=pid, thinking_enabled=self._thinking_on)
+            provider_id=pid, thinking_enabled=self._thinking_on,
+            agent_mode=self._agent_on, approval=self._approval)
         self._worker.token.connect(self._on_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
@@ -970,7 +1206,10 @@ class ChatPage(QWidget):
 
     @Slot(str)
     def _on_token(self, piece: str):
-        # 思考增量被 THINK_TAG 包裹，与正文分离，避免混入回复文本
+        # 思考增量被 THINK_TAG 包裹，与正文分离，避免混入回复文本；
+        # 工具活动被 TOOL_TAG 包裹（智能体模式），解析成状态行事件。
+        # 两者都走同一 token 通道，逐段剥离（tag 可能跨 piece 到达）。
+        piece = self._strip_tool_tags(piece)
         while THINK_TAG in piece:
             before, _, rest = piece.partition(THINK_TAG)
             if before:
@@ -981,8 +1220,36 @@ class ChatPage(QWidget):
             piece = after
         if piece:
             self._pending_assistant.append(piece)
-        # 整段重建：确认消息 + 流式中的助手气泡，防抖刷盘
-        self._reset_history_view()
+        # 增量流式：只重建并刷入最后一条进行中气泡（历史已渲染，不再每次全量重排）。
+        # 结束时（on_finished）再走整段 _reset_history_view 固化全部。
+        self._refresh_streaming()
+
+    def _strip_tool_tags(self, piece: str) -> str:
+        """剥离 TOOL_TAG 包裹的工具事件段，累积到 _pending_tools。
+
+        事件为完整 JSON（yield 时整段给出，不跨 piece），解析失败整段丢弃——
+        控制字符不会由模型文本伪造（见 agent_bridge 的 yield 侧包装）。
+        """
+        while TOOL_TAG in piece:
+            before, _, rest = piece.partition(TOOL_TAG)
+            if before:
+                self._pending_assistant.append(before)
+            evt, _, after = rest.partition(TOOL_END_TAG)
+            try:
+                data = _json.loads(evt)
+                # call 事件第四位存参数摘要；result 事件存返回文本（含产出路径，
+                # 供 _tools_html 渲染「🔗 打开」链接）。
+                if data.get("kind") == "call":
+                    detail = str(data.get("args", "") or "")
+                else:
+                    detail = str(data.get("text", "") or "")
+                self._pending_tools.append((
+                    str(data.get("name", "?")), str(data.get("kind", "")),
+                    bool(data.get("ok", True)), detail))
+            except Exception:
+                pass
+            piece = after
+        return piece
 
     @Slot(object)
     def _on_finished(self, result):
@@ -1002,6 +1269,9 @@ class ChatPage(QWidget):
             if thinking:
                 # 思考内容存到当前（或上一条）assistant 消息的 _thinking 字段
                 self.session.messages[-1]["_thinking"] = thinking
+        # 智能体模式：把本轮工具活动存进这条助手消息，重放时仍可展示
+        if self._pending_tools:
+            self.session.messages[-1]["_tools"] = list(self._pending_tools)
         self._cleanup_worker()
         self._reset_history_view()
         self._scroll_to_bottom()
@@ -1020,7 +1290,11 @@ class ChatPage(QWidget):
         self._worker = None
         self._pending_assistant = []
         self._pending_thinking = []
+        self._pending_tools = []
         self._set_busy(False)
+        # 流式结束/停止：移除页面里的增量流式节点与光标，避免残留。
+        self._pending_stream_html = None
+        self._view_stop_streaming()
         if w is not None and w.isRunning():
             # 线程仍在运行（点了「停止/清空」）。不能直接丢引用——
             # 否则运行中的 QThread 被 GC 销毁时会触发
@@ -1088,6 +1362,7 @@ class ChatPage(QWidget):
         self.session.clear()
         self._pending_assistant = []
         self._pending_thinking = []
+        self._pending_tools = []
         self._pending_images = []
         self._think_open = {}
         self._notice_html = ""
@@ -1121,6 +1396,7 @@ class ChatPage(QWidget):
         self.stop_btn.setText(self.tr("停止", "Stop"))
         self.clear_btn.setText(self.tr("清空", "Clear"))
         self._update_think_btn_text()
+        self._update_agent_btn_text()
         self._update_image_btn()
         # 重放气泡（角色名 / 统计文案随语言/换肤刷新）。属原地重绘，保持滚动位置，
         # 不再每次切主题都把对话弹到最底部。

@@ -47,6 +47,25 @@ def _data_dir() -> str:
 DATA_DIR = _data_dir()
 DB_PATH = os.path.join(DATA_DIR, "lightbox.db")
 
+
+def _output_root() -> str:
+    """智能体模式的文件产出根目录：系统「文档」下的 LightAIBoxOutputs。
+
+    拿不到「文档」目录（如嵌入式/无 Documents 的环境）则回退到数据目录下的 Outputs。
+    """
+    try:
+        from PySide6.QtCore import QStandardPaths
+        docs = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation)
+        if docs:
+            return os.path.join(docs, "LightAIBoxOutputs")
+    except Exception:
+        pass
+    return os.path.join(DATA_DIR, "Outputs")
+
+
+OUTPUT_ROOT = _output_root()
+
 # 调度策略常量
 POLICY_LONG_FIRST = "long_first"    # 长输入优先
 POLICY_SHORT_FIRST = "short_first"  # 短输入优先
@@ -71,3 +90,6 @@ DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 MODEL_AUTO = "auto"                        # 虚拟模型名：触发自适应调度
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8765
+# 统一 API 服务监听地址/端口的 QSettings 持久化键（自动启动时据此绑定）
+SETTINGS_SERVER_HOST = "api/host"
+SETTINGS_SERVER_PORT = "api/port"

@@ -48,3 +48,5 @@ UI_SPEC.md
 # === 系统文件 ===
 .DS_Store
 Thumbs.db
+# === LightAgents 运行时产物（trace/devlog/session 等，不提交） ===
+memory/
