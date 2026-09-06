@@ -843,6 +843,22 @@ class ChatPage(QWidget):
         Signal 跨线程投递。模态弹窗会阻塞主线程事件循环——但工具线程此刻正阻塞在
         Event.wait() 上，两者互不占用对方，不会死锁。
         """
+        # SSH 远程执行：proposal 携带 {action:"ssh", host, command}。远端代码执行属高危，
+        # 单独弹「允许 SSH 执行？」确认框，明示主机与命令。
+        if proposal.get("action") == "ssh":
+            title = self.tr("允许 SSH 执行？", "Allow SSH execution?")
+            text = self.tr(
+                "智能体请求通过 SSH 在远端执行命令：\n\n"
+                "主机：{host}\n"
+                "命令：{command}\n\n"
+                "是否允许执行？",
+                "The agent requests to run a command over SSH:\n\n"
+                "Host: {host}\nCommand: {command}\n\nAllow it?").format(
+                host=proposal.get("host", ""), command=proposal.get("command", ""))
+            yes = MessageBox.question(self, title, text) == QMessageBox.Yes
+            self._approval.resolve(proposal, yes)
+            return
+
         def _human(n: int) -> str:
             if n < 1024:
                 return f"{n} 字节"

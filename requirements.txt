@@ -14,3 +14,5 @@ pyyaml>=6.0
 # 智能体产出文件：word/excel（app/file_tools.py，结构化生成）
 python-docx>=0.8
 openpyxl>=3.0
+# 智能体 SSH 远程命令执行（app/gateway_llm.py 内 SSHExecTool，paramiko 纯 Python）
+paramiko>=3.0

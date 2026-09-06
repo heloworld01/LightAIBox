@@ -931,6 +931,22 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
         for tool in file_tools.list_tools():
             registry.register_tool(DesktopToolAdapter(file_tools, tool["name"]))
 
+    # SSH 远程命令执行（paramiko）：SSH = 远端代码执行，只有提供了 approval 确认
+    # 闸门才注册（与 file_tools 同条件）。每次执行前经 approval.await_approval 弹窗
+    # 让人工确认「主机 + 命令」；认证凭据全部来自构造参数（模型不可见）。
+    ssh_tool = None
+    if approval is not None:
+        try:
+            from light_agents.tools.builtin.ssh_exec_tool import SSHExecTool  # noqa: PLC0415
+            ssh_tool = SSHExecTool(
+                approval=lambda host, cmd: approval.await_approval(
+                    {"action": "ssh", "host": host, "command": cmd}),
+            )
+            if registry.get_tool("ssh_exec") is None:
+                registry.register_tool(ssh_tool)
+        except Exception:  # noqa: BLE001 —— paramiko 缺失/框架不兼容则跳过注册
+            ssh_tool = None
+
     # 工具发现：目录 + FindTools 元工具（常驻）
     catalog = ToolCatalog(registry)
     from light_agents.tools.builtin.find_tools_tool import FindToolsTool
@@ -989,4 +1005,15 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
                 + ([t["name"].replace("write_", "")] if t["name"].startswith("write_") else []),
                 category="output", resident=True,
             )
+    if ssh_tool is not None:
+        # SSH 非常驻：需经 FindTools 检索（ssh / 远程 / 服务器 / 执行命令 等）发现后
+        # 才按需激活并注入 schema，且始终过 approval 确认闸门，界面更保守。
+        catalog.add_entry(
+            name=ssh_tool.name,
+            description=ssh_tool.description,
+            tags=["ssh", "远程", "服务器", "主机", "命令行", "执行命令", "部署",
+                  "remote", "server", "shell", "deploy"],
+            category="remote",
+            resident=False,
+        )
     return registry, catalog
