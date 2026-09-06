@@ -1,5 +1,6 @@
 """AI 网关页：Provider 管理 + 调用记录。"""
 import datetime
+import json
 
 from PySide6.QtCore import QMutex, QRect, QThread, QTimer, Qt, QWaitCondition, Signal, Slot
 from PySide6.QtGui import QColor, QPen
@@ -8,6 +9,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -497,6 +499,10 @@ class GatewayPage(QWidget):
         self.del_btn.setProperty("class", "danger")
         self.reset_btn = QPushButton(self.tr("重置配额", "Reset quota"))
         self.reset_btn.setProperty("class", "secondary")
+        self.import_btn = QPushButton(self.tr("导入", "Import"))
+        self.import_btn.setProperty("class", "secondary")
+        self.export_btn = QPushButton(self.tr("导出", "Export"))
+        self.export_btn.setProperty("class", "secondary")
         pb.addWidget(self.add_btn)
         pb.addWidget(self.edit_btn)
         pb.addWidget(self.copy_btn)
@@ -521,6 +527,8 @@ class GatewayPage(QWidget):
         self.copy_btn.clicked.connect(self._on_copy_provider)
         self.del_btn.clicked.connect(self._on_delete_provider)
         self.reset_btn.clicked.connect(self._on_reset_quota)
+        self.import_btn.clicked.connect(self._on_import_providers)
+        self.export_btn.clicked.connect(self._on_export_providers)
         self.up_btn.clicked.connect(lambda: self._on_move(-1))
         self.down_btn.clicked.connect(lambda: self._on_move(1))
 
@@ -639,6 +647,8 @@ class GatewayPage(QWidget):
         self.copy_btn.setText(tr("复制", "Copy"))
         self.del_btn.setText(tr("删除", "Delete"))
         self.reset_btn.setText(tr("重置配额", "Reset quota"))
+        self.import_btn.setText(tr("导入", "Import"))
+        self.export_btn.setText(tr("导出", "Export"))
         self.up_btn.setText(tr("↑ 上移", "↑ Up"))
         self.down_btn.setText(tr("↓ 下移", "↓ Down"))
         self.log_header.title_label.setText(tr("调用记录", "Call Logs"))
@@ -917,6 +927,180 @@ class GatewayPage(QWidget):
         p.disable_reason = ""
         self.gateway.providers.upsert(p)
         self.refresh_providers()
+
+    # ------------------------------------------------------------------ #
+    # Import / Export
+    # ------------------------------------------------------------------ #
+    # 导出只包含用户配置字段（不含运行时统计、id、sort_order 等），导入时为
+    # 每条记录分配新 id 与顺序、清零用量；名称冲突时自动追加序号重命名。
+    _IMPORT_EXPORT_VERSION = 1
+    # 可导出的配置字段（与 Provider dataclass 对齐，排除运行时状态）
+    _EXPORT_FIELDS = ("name", "api_type", "base_url", "api_key", "model",
+                      "enabled", "multimodal", "min_input_tokens",
+                      "quota_type", "quota_limit")
+    _VALID_API_TYPES = {config.API_OPENAI, config.API_ANTHROPIC, config.API_BOTH}
+    _VALID_QUOTA_TYPES = {config.QUOTA_UNLIMITED, config.QUOTA_CALLS,
+                          config.QUOTA_TOKENS}
+
+    def _provider_to_dict(self, p) -> dict:
+        """把一个 Provider 序列化为可导出的 dict（仅配置字段）。"""
+        return {f: getattr(p, f) for f in self._EXPORT_FIELDS}
+
+    def _dict_to_provider(self, d: dict, names: set) -> "Provider":
+        """把导入 dict 还原为 Provider，字段级校验并归一化。
+
+        `names` 为当前已存在的 provider 名集合，用于冲突时自动重命名。
+        非法类型/缺字段会抛 ValueError（由调用方转为用户提示）。
+        """
+        from ..models import Provider
+
+        name = str(d.get("name", "")).strip()
+        api_type = d.get("api_type", config.API_OPENAI)
+        base_url = str(d.get("base_url", "")).strip()
+        api_key = str(d.get("api_key", "")).strip()
+        model = str(d.get("model", "")).strip()
+
+        if not name or not api_key or not model:
+            raise ValueError(
+                self.tr("名称、API Key、模型为必填项",
+                        "Name, API Key and Model are required"))
+        if api_type not in self._VALID_API_TYPES:
+            raise ValueError(
+                self.tr(f"无效的协议类型：{api_type}",
+                        f"Invalid API type: {api_type}"))
+
+        quota_type = d.get("quota_type", config.QUOTA_UNLIMITED)
+        if quota_type not in self._VALID_QUOTA_TYPES:
+            raise ValueError(
+                self.tr(f"无效的配额类型：{quota_type}",
+                        f"Invalid quota type: {quota_type}"))
+
+        def _as_int(v, default=0):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        def _as_bool(v, default=False):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            return default
+
+        # 名称冲突时自动追加序号重命名（「name 2」「name 3」…）
+        final_name = name
+        if name in names:
+            i = 2
+            while f"{name} {i}" in names:
+                i += 1
+            final_name = f"{name} {i}"
+        names.add(final_name)
+
+        quota_limit = _as_int(d.get("quota_limit", 0))
+        return Provider(
+            name=final_name,
+            api_type=api_type,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            enabled=_as_bool(d.get("enabled", True), True),
+            multimodal=_as_bool(d.get("multimodal", False), False),
+            min_input_tokens=_as_int(d.get("min_input_tokens", 0)),
+            quota_type=quota_type,
+            quota_limit=quota_limit,
+        )
+
+    def _on_export_providers(self):
+        """把当前全部 provider 的配置导出为 JSON 文件。"""
+        providers = self.gateway.providers.list()
+        if not providers:
+            MessageBox.information(
+                self, self.tr("提示", "Notice"),
+                self.tr("当前没有可导出的 Provider", "No providers to export"))
+            return
+        default_name = datetime.datetime.now().strftime(
+            "providers_%Y%m%d_%H%M%S.json")
+        path, _ = QFileDialog.getSaveFileName(
+            self, self.tr("导出 Provider", "Export providers"),
+            default_name, self.tr("JSON 文件 (*.json)", "JSON files (*.json)"))
+        if not path:
+            return
+        payload = {
+            "version": self._IMPORT_EXPORT_VERSION,
+            "providers": [self._provider_to_dict(p) for p in providers],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            MessageBox.warning(
+                self, self.tr("导出失败", "Export failed"),
+                self.tr(f"无法写入文件：{exc}", f"Cannot write file: {exc}"))
+            return
+        MessageBox.information(
+            self, self.tr("导出成功", "Export successful"),
+            self.tr(f"已导出 {len(providers)} 个 Provider 到：\n{path}",
+                    f"Exported {len(providers)} provider(s) to:\n{path}"))
+
+    def _on_import_providers(self):
+        """从 JSON 文件导入 provider，追加到列表末尾，不覆盖现有。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, self.tr("导入 Provider", "Import providers"), "",
+            self.tr("JSON 文件 (*.json)", "JSON files (*.json)"))
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            MessageBox.warning(
+                self, self.tr("导入失败", "Import failed"),
+                self.tr(f"无法读取文件：{exc}", f"Cannot read file: {exc}"))
+            return
+
+        if not isinstance(payload, dict) or not isinstance(
+                payload.get("providers"), list):
+            MessageBox.warning(
+                self, self.tr("导入失败", "Import failed"),
+                self.tr("文件格式不正确：应为含 providers 列表的 JSON",
+                        "Invalid format: expected JSON with a providers list"))
+            return
+
+        existing = self.gateway.providers.list()
+        names = {p.name for p in existing}
+
+        imported = []
+        for item in payload["providers"]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                imported.append(self._dict_to_provider(item, names))
+            except ValueError as exc:
+                MessageBox.warning(
+                    self, self.tr("导入失败", "Import failed"),
+                    self.tr(f"条目无效：{exc}", f"Invalid entry: {exc}"))
+                return
+        if not imported:
+            MessageBox.information(
+                self, self.tr("提示", "Notice"),
+                self.tr("未从文件中读取到任何有效 Provider",
+                        "No valid provider read from file"))
+            return
+
+        # 追加到列表末尾（末尾即最低调度优先级）
+        next_order = len(existing)
+        for p in imported:
+            p.sort_order = next_order
+            self.gateway.providers.upsert(p)
+            next_order += 1
+        self.refresh_providers()
+        MessageBox.information(
+            self, self.tr("导入成功", "Import successful"),
+            self.tr(f"已导入 {len(imported)} 个 Provider",
+                    f"Imported {len(imported)} provider(s)"))
 
     def _on_move(self, delta: int):
         """上移(-1)/下移(+1)：调整 provider 列表顺序，即调度优先级。"""
