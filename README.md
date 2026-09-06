@@ -12,7 +12,7 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 
 - **Unified API proxy** — a single `chat` / `chat_stream` interface hides the OpenAI / Anthropic protocol differences. Call a specific model, or leave it unset to auto-select a provider by policy.
 - **Claude Code ready** — the Anthropic-compatible endpoint fully passes through `tools` and multi-turn `tool_result`, with spec-compliant streaming `tool_use` events, so it can drive Claude Code's multi-step agent loop directly.
-- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, collapsible **thinking** display, **image uploads for multimodal chats**, and time separators (see [Built-in Chat](#built-in-chat)).
+- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, collapsible **thinking** display, **image uploads for multimodal chats**, an optional **agent mode** that runs a LightAgents SuperAgent orchestration loop (intent routing + tool discovery + streaming) with built-in desktop tools and **sandboxed file generation** (docx / xlsx), and time separators (see [Built-in Chat](#built-in-chat)).
 - **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model, multimodal flag), with background connectivity testing that never blocks the UI.
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure. Image requests route only to providers flagged as multimodal (a clear error instead of silently dropping images); mislabeled providers get the flag auto-revoked after repeated image failures.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
@@ -99,9 +99,61 @@ same gateway, so it works with any configured provider (or `auto` scheduling):
   (png / jpg / jpeg / gif / webp, multi-select), sent base64-encoded with the next
   message and shown as thumbnails in the bubble; `auto` scheduling routes image
   requests only to providers flagged multimodal.
+- **Agent mode** — an "Agent: on / off" toggle in the top bar (persisted). When on, replies
+  are produced by a **LightAgents SuperAgent orchestration** loop instead of a plain
+  completion: intent routing → sub-agent dispatch → tool discovery → streaming synthesis.
+  The model can call built-in read-only desktop tools, produce sandboxed files (docx / xlsx,
+  each write confirmed), observe results, and keep reasoning until it can give a final
+  answer. Tool activity (which tool ran, its arguments, success / failure) is rendered as
+  status lines inside the assistant bubble, above the thinking block, and is preserved when
+  the conversation is replayed. See [Agent Mode](#agent-mode).
 - **Theme-aware** — bubble / avatar / time colors follow the dark / light theme; the chat
   canvas is transparent so theme switches apply instantly with no one-frame lag, and a thin
   (6px) scrollbar keeps it unobtrusive.
+
+### Agent Mode
+
+Toggling **Agent: on** switches the chat from a single streaming completion to a
+**LightAgents SuperAgent** orchestration loop driven through the same local gateway:
+
+1. The model receives the conversation plus JSON schemas of the available tools.
+2. SuperAgent routes the intent, discovers and dispatches the relevant tools (or
+   sub-agents), and streams each step in-band.
+3. If a tool would help, it is **executed locally** and its observation is fed back to the
+   model, which keeps reasoning (up to 5 steps) until it answers in natural language; the
+   summary is streamed token-by-token into the bubble.
+
+Key properties:
+
+- **Protocol-aware** — the loop speaks both function-calling dialects: OpenAI
+  `tool_calls` / `role: "tool"` messages and Anthropic `tool_use` / `tool_result` content
+  blocks. The gateway picks a provider for the first step, then **locks onto it** so
+  tool-call messages never cross protocols (which upstream APIs would reject). Under the
+  hood a `GatewayLLM` duck-typed adapter (`app/gateway_llm.py`) presents the multi-provider
+  gateway to LightAgents as a single model.
+- **Read-only desktop tools** — `get_current_time` (local date / time / timezone / region,
+  inferred offline from the local timezone), `calculator` (arithmetic expressions parsed
+  through an AST whitelist — `__import__` / `exec` and friends are rejected), and
+  `get_gateway_status` (configured providers, their models, usage / quota and speed — handy
+  for "what models can I use right now?").
+- **Sandboxed file generation** — `write_text` / `write_docx` / `write_xlsx` let the agent
+  actually produce deliverables. Files are generated **structurally** with
+  python-docx / openpyxl (no arbitrary script execution, no external CLI), written only
+  inside a per-session sandbox under `Documents/LightAIBoxOutputs/<date>/<session>/`
+  (`app/config.py` `OUTPUT_ROOT`), capped at 20 MB, and **every write is confirmed by a
+  dialog** showing the path, type and size before anything hits disk
+  (`app/approval.py` + `app/file_tools.py`). Produced files are surfaced as a `🔗 打开`
+  link you can click to open in the system default app.
+- **Fail-safe observations** — a tool error becomes an observation (`❌ …`) fed back to
+  the model instead of aborting the loop; it can retry or explain.
+- **Transparent UI** — each step streams in-band: tool calls and results appear as
+  `🔧 ✓ calculator 2+3*4 = 14` status lines in the bubble, thinking segments in the
+  collapsible block (if thinking mode is on), and the final answer as normal markdown.
+
+Under the hood the orchestration is provided by the external LightAgents framework
+(`../LightAgents`, SuperAgent + sub-agents + tool discovery via ToolCatalog / FindTools),
+streamed through `app/agent_bridge.py`; the desktop tool registry lives in
+`app/gateway_llm.py` + `app/agent_tools.py`.
 
 ## Project Structure
 
@@ -115,8 +167,13 @@ app/
 ├── server.py        # unified API service (FastAPI + uvicorn)
 ├── db.py            # SQLite persistence
 ├── chat_session.py  # chat session: multi-turn history + display timestamps
+├── agent_bridge.py  # agent mode: LightAgents SuperAgent orchestration, streamed over the gateway
+├── gateway_llm.py   # GatewayLLM (gateway as a single LightAgents LLM) + StreamingSuperAgent + desktop registry
+├── agent_tools.py   # built-in read-only desktop tools + JSON-schema export
+├── approval.py      # cross-thread write-confirmation coordinator (proposal + per-write dialog)
+├── file_tools.py    # sandboxed file generation (write_text / write_docx / write_xlsx)
 └── ui/              # PySide6 UI
-    ├── chat_page.py # Chat tab: WeChat-style bubbles + MathJax rendering
+    ├── chat_page.py # Chat tab: WeChat-style bubbles + MathJax rendering + agent mode
     ├── providers_bar.py # floating always-on-top panel: header + running providers + quota (right-aligned model/usage, lock/close buttons)
     └── resources/chat/  # chat container HTML + bundled MathJax v3 + mermaid (offline)
 ```

@@ -12,7 +12,7 @@
 
 - **统一 API 代理**：`chat` / `chat_stream` 一个接口屏蔽 OpenAI 与 Anthropic 协议差异，支持指定模型与按策略自适应、一次性与流式输出。
 - **Claude Code 直连**：Anthropic 兼容端点完整透传 `tools` 与多轮 `tool_result`，流式 tool_use 遵循官方协议，可直接承载多步 agent 循环。
-- **内置对话**：应用内即含微信式**对话**页，流式回复、Markdown + 离线 MathJax 渲染 LaTeX 公式与 mermaid 图表、每条回复可「原文 / 渲染」切换、思考模式折叠展示、可发送图片做多模态对话、带时间分隔条（详见[内置对话](#内置对话)）。
+- **内置对话**：应用内即含微信式**对话**页，流式回复、Markdown + 离线 MathJax 渲染 LaTeX 公式与 mermaid 图表、每条回复可「原文 / 渲染」切换、思考模式折叠展示、可发送图片做多模态对话、可开启**智能体模式**走 LightAgents SuperAgent 编排（意图路由 + 工具发现 + 流式汇总）并配内置桌面工具与**沙箱文件产出（docx / xlsx）**、带时间分隔条（详见[内置对话](#内置对话)）。
 - **多 Provider 管理**：可视化增删改查，后台测连不卡界面、无弹窗；每个 Provider 可标记「支持多模态（图片）」，列表以 🖼 标识。
 - **智能调度**：按策略（长输入优先 / 短输入优先）挑选，单 Provider 失败自动降级重试；含图片的请求只路由到标记为多模态的 Provider（无匹配则明确报错，不静默丢图），误标多模态的 Provider 发图连续失败后自动撤销标记。
 - **配额控制**：按调用次数或 token 数设限，超配额自动停用、可一键重置。
@@ -86,8 +86,50 @@ claude
 - **多模态图片**：输入区「🖼 图片」按钮选择本地图片（png / jpg / jpeg / gif / webp，
   可多选），读成 base64 随下一条消息发送，气泡内以缩略图展示；`auto` 调度自动把含图
   请求路由到标记为多模态的 Provider，纯文本对话不受影响。
+- **智能体模式**：顶栏「智能体：开 / 关」按钮（偏好持久化）。开启后回复由
+  **LightAgents SuperAgent 编排循环**驱动而非单次补全：意图路由 → 子代理分发 → 工具
+  发现 → 流式汇总。模型可调用内置只读桌面工具、产出沙箱文件（docx / xlsx，每次写入
+  需确认）、观察结果、继续推理直至给出最终答案。工具活动（调了什么、参数、成败）以
+  状态行呈现在气泡内、思考块上方，且随会话重放保留。详见[智能体模式](#智能体模式)。
 - **主题自适应**：气泡 / 头像 / 时间颜色随暗 / 亮主题切换；对话画布透明化，换肤即时生效
   无「滞后一帧」，并配 6px 细滚动条。
+
+### 智能体模式
+
+顶栏开启**智能体：开**后，对话从单次流式补全切换为经同一本地网关驱动的
+**LightAgents SuperAgent** 编排循环：
+
+1. 模型收到对话历史与可用工具的 JSON Schema；
+2. SuperAgent 理解意图、发现并分发相关工具（或子代理），把每一步随流式呈现；
+3. 判断到需要外部信息 / 计算 / 产出文件时发出工具调用，应用**在本地执行该工具**并把
+   观察结果回喂模型；模型基于观察继续推理（至多 5 步），最终汇总逐 token 刷入气泡。
+
+关键特性：
+
+- **协议感知**：循环同时支持两种 function calling 方言——OpenAI 的 `tool_calls` /
+  `role: "tool"` 消息，与 Anthropic 的 `tool_use` / `tool_result` 内容块。首轮由网关
+  自适应调度选 Provider，拿到工具调用后即**锁定该 Provider**，保证工具消息永不跨协议
+  混传（上游会直接 400）。底层由 `GatewayLLM` 鸭子类型适配器（`app/gateway_llm.py`）
+  把多 provider 网关伪装成 LightAgents 眼中的单一模型。
+- **只读桌面工具**：`get_current_time`（本地日期 / 时间 / 时区 / 地点，由本地时区离线
+  推断，不联网）、`calculator`（算术表达式，AST 白名单解析，`__import__` / `exec` 等
+  一律拒绝）、`get_gateway_status`（已配置的 Provider、模型、用量 / 配额与速度，回答
+  「现在能用什么模型」很方便）。
+- **沙箱文件产出**：`write_text` / `write_docx` / `write_xlsx` 让智能体能真正把成果写
+  成文件。用 python-docx / openpyxl **结构化生成**（不执行任意脚本、不依赖外部 CLI），
+  仅写入会话沙箱目录 `文档/LightAIBoxOutputs/<日期>/<会话>/`（`app/config.py`
+  `OUTPUT_ROOT`），上限 20 MB；**每次写入前都弹窗确认**（路径 / 类型 / 大小），确认后
+  才落盘（`app/approval.py` + `app/file_tools.py`）。产出的文件以 `🔗 打开` 链接呈现，
+  点击即在系统默认应用中打开。
+- **失败不中断**：工具报错转为观察结果（`❌ …`）回喂模型，可重试或如实说明，而非直接
+  终止循环。
+- **透明 UI**：每一步都随流式呈现——工具调用与结果以 `🔧 ✓ calculator 2+3*4 = 14`
+  状态行出现在气泡内，思考段进可折叠块（若开启思考模式），最终答案按常规 markdown
+  渲染。
+
+底层编排来自外部 LightAgents 框架（`../LightAgents`，SuperAgent + 子代理 +
+ToolCatalog / FindTools 工具发现），经 `app/agent_bridge.py` 流式接入；桌面工具注册表在
+`app/gateway_llm.py` + `app/agent_tools.py`。
 
 ## 目录结构
 
@@ -101,11 +143,18 @@ app/
 ├── server.py        # 统一 API 服务（FastAPI + uvicorn）
 ├── db.py            # SQLite 持久化
 ├── chat_session.py  # 对话会话：多轮消息历史 + 展示用时间戳
+├── agent_bridge.py  # 智能体模式：LightAgents SuperAgent 编排，经网关流式接入
+├── gateway_llm.py   # GatewayLLM（网关伪装成单一 LightAgents LLM）+ StreamingSuperAgent + 桌面工具注册表
+├── agent_tools.py   # 内置只读桌面工具 + JSON Schema 导出
+├── approval.py      # 跨线程写入确认协调器（提案 + 每次写入弹窗确认）
+├── file_tools.py    # 沙箱文件产出（write_text / write_docx / write_xlsx）
 └── ui/              # PySide6 界面
-    ├── chat_page.py # 「对话」页：微信式气泡 + MathJax 公式渲染
+    ├── chat_page.py # 「对话」页：微信式气泡 + MathJax 公式渲染 + 智能体模式
     ├── providers_bar.py # 悬浮置顶面板：标题条 + 运行中 Provider + 用量/余量（模型/用量右对齐，锁定/关闭按钮）
     └── resources/chat/  # 对话容器 HTML + 本地打包 MathJax v3 + mermaid（离线）
 ```
+
+> LightAgents 智能体框架现引用外部源码库 `../LightAgents`（此前内嵌于 vendor/）。
 
 ## 许可证
 
