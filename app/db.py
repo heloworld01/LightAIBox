@@ -182,6 +182,64 @@ class ProviderStore:
             )
             conn.commit()
 
+    # ------------------------------------------------------------------ #
+    # 运行时状态写入（定向 UPDATE，不覆盖用户配置字段）
+    #
+    # 背景：chat / chat_stream 在调用开始时从 DB 读出 Provider 快照，网络调用
+    # 可能持续很久；期间用户可能停用 provider、调整优先级、改密钥等。调用结束
+    # 后若用旧快照走全字段 upsert 回写，会把陈旧的 enabled / sort_order /
+    # api_key 等覆盖回 DB——表现为「停用的 provider 被自动重新启用」「调整过
+    # 的优先级被改回去」。因此网关的运行时路径（记用量、自动关闭、撤销多模态
+    # 标记）必须用下面的定向 UPDATE：只写运行时字段，永不碰用户配置字段。
+    # 全量 upsert 仅保留给 UI 的创建 / 编辑 / 排序路径。
+    # ------------------------------------------------------------------ #
+    def record_usage(self, provider_id: int, calls: int, tokens: int,
+                     tokens_per_sec: float, call_at: str,
+                     auto_disable: bool = False) -> None:
+        """累加用量并更新最近速度；auto_disable=True 时同时自动关闭。
+
+        只写用量 / 统计与（必要的）关闭字段；enabled 永不会被置回 1，
+        sort_order / 密钥等用户配置不受影响。
+        """
+        with _connect() as conn:
+            if auto_disable:
+                conn.execute(
+                    "UPDATE providers SET "
+                    " used_calls = used_calls + ?, used_tokens = used_tokens + ?,"
+                    " last_tokens_per_sec = ?, last_call_at = ?,"
+                    " enabled = 0, auto_disabled = 1, disable_reason = 'quota'"
+                    " WHERE id = ?",
+                    (calls, tokens, tokens_per_sec, call_at, provider_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE providers SET "
+                    " used_calls = used_calls + ?, used_tokens = used_tokens + ?,"
+                    " last_tokens_per_sec = ?, last_call_at = ?"
+                    " WHERE id = ?",
+                    (calls, tokens, tokens_per_sec, call_at, provider_id),
+                )
+            conn.commit()
+
+    def disable_auto(self, provider_id: int, reason: str) -> None:
+        """自动关闭 provider（连续失败达阈值等），只写关闭相关字段。"""
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE providers SET enabled = 0, auto_disabled = 1, "
+                "disable_reason = ? WHERE id = ?",
+                (reason, provider_id),
+            )
+            conn.commit()
+
+    def set_multimodal(self, provider_id: int, flag: bool) -> None:
+        """设置多模态标记（多模态误标自愈用），只写该字段。"""
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE providers SET multimodal = ? WHERE id = ?",
+                (int(flag), provider_id),
+            )
+            conn.commit()
+
 
 # --------------------------------------------------------------------------- #
 # CallLog
