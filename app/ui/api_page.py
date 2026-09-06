@@ -1,8 +1,9 @@
 """统一 API 服务控制页：端口、协议开关、启动/停止、端点地址展示与复制。"""
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import QSettings, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -27,6 +28,7 @@ class ApiPage(QWidget):
         self.gateway = gateway
         self.server = server
         self.tr = LanguageManager().tr
+        self._syncing = False
         self._build_ui()
         self._sync_from_server()
 
@@ -71,6 +73,25 @@ class ApiPage(QWidget):
         self.port_spin.setFixedWidth(100)
         self.port_label = QLabel(self.tr("端口", "Port"))
         cf.addRow(self.port_label, self.port_spin)
+
+        # 监听地址：默认仅本机；切到 0.0.0.0 可被非本机（同网段/局域网）访问。
+        # 注意：服务当前无鉴权，绑 0.0.0.0 即把代用本机 provider 密钥的代理暴露给
+        # 能连到该端口的任何设备，仅用于可信内网临时开放（对应「先打开，暂不加 KEY」）。
+        self.host_combo = QComboBox()
+        self.host_combo.setFixedWidth(220)
+        self._host_options = [
+            ("127.0.0.1",
+             self.tr("仅本机 (127.0.0.1)",
+                     "Localhost only (127.0.0.1)")),
+            ("0.0.0.0",
+             self.tr("所有网卡 / 局域网 (0.0.0.0)",
+                     "All interfaces / LAN (0.0.0.0)")),
+        ]
+        for value, label in self._host_options:
+            self.host_combo.addItem(label, value)
+        self.host_combo.currentIndexChanged.connect(self._on_host_changed)
+        self.host_label = QLabel(self.tr("监听地址", "Listen Host"))
+        cf.addRow(self.host_label, self.host_combo)
 
         self.openai_check = QCheckBox(
             self.tr("启用 OpenAI 兼容接口 (/v1/chat/completions, /v1/models)",
@@ -166,7 +187,25 @@ class ApiPage(QWidget):
 
     def _current_url(self, template: str) -> str:
         cfg = self.server.config
-        return template.format(host=cfg.host, port=cfg.port)
+        return template.format(host=self._display_host(), port=cfg.port)
+
+    def _display_host(self):
+        """对外展示的地址：host 为 0.0.0.0 时解析成局域网 IP，否则原样。"""
+        host = self.server.config.host
+        if host in ("0.0.0.0", "::"):
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    ip = s.getsockname()[0]
+                    if ip:
+                        return ip
+                finally:
+                    s.close()
+            except Exception:  # noqa: BLE001 —— 解析失败退回原始 host
+                pass
+        return host
 
     def _sync_from_server(self):
         cfg = self.server.config
@@ -178,6 +217,13 @@ class ApiPage(QWidget):
         anthropic_enabled = cfg.anthropic_enabled
         port = cfg.port
         self.port_spin.setValue(port)
+        self._syncing = True
+        try:
+            host_idx = self.host_combo.findData(cfg.host)
+            if host_idx >= 0:
+                self.host_combo.setCurrentIndex(host_idx)
+        finally:
+            self._syncing = False
         self.openai_check.setChecked(openai_enabled)
         self.anthropic_check.setChecked(anthropic_enabled)
         self._update_urls()
@@ -201,6 +247,13 @@ class ApiPage(QWidget):
             "\"auto\" for adaptive scheduling."))
         self.ctrl_header.title_label.setText(tr("服务控制", "Service Control"))
         self.port_label.setText(tr("端口", "Port"))
+        self.host_label.setText(tr("监听地址", "Listen Host"))
+        for i, (value, _label) in enumerate(self._host_options):
+            self.host_combo.setItemText(i, self.tr(
+                "仅本机 (127.0.0.1)", "Localhost only (127.0.0.1)")
+                if value == "127.0.0.1" else
+                self.tr("所有网卡 / 局域网 (0.0.0.0)",
+                        "All interfaces / LAN (0.0.0.0)"))
         self.protocol_label.setText(tr("协议", "Protocol"))
         self.openai_check.setText(tr(
             "启用 OpenAI 兼容接口 (/v1/chat/completions, /v1/models)",
@@ -227,11 +280,12 @@ class ApiPage(QWidget):
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         self.port_spin.setEnabled(not running)
+        # 监听地址运行中也保持可切换：改动触发即时重启（uvicorn 在启动时决定绑定）。
         if running:
             self.status_badge.set_status(
                 tr("运行中", "Running"), "success")
             self.status_badge.setToolTip(
-                f"http://{self.server.config.host}:{self.server.config.port}")
+                f"http://{self._display_host()}:{self.server.config.port}")
         else:
             self.status_badge.set_status(tr("已停止", "Stopped"), "neutral")
             self.status_badge.setToolTip("")
@@ -239,6 +293,34 @@ class ApiPage(QWidget):
     # ------------------------------------------------------------------ #
     # 交互
     # ------------------------------------------------------------------ #
+    def _persist(self):
+        """把监听地址/端口写入 QSettings，供下次自动启动时沿用。"""
+        from .. import config as _cfg
+        s = QSettings()
+        s.setValue(_cfg.SETTINGS_SERVER_HOST, self.host_combo.currentData())
+        s.setValue(_cfg.SETTINGS_SERVER_PORT, self.port_spin.value())
+
+    def _on_host_changed(self):
+        if self._syncing:
+            return
+        self._persist()
+        host = self.host_combo.currentData()
+        self.server.config.set(host=host)
+        if not self.server.is_running:
+            self._update_urls()
+            return
+        # 运行中切换监听地址 → 用新 host 重建并重启服务，即时生效。
+        self.server.stop()
+        cfg = ServerConfig(
+            host=host,
+            port=self.server.config.port,
+            openai_enabled=self.server.config.openai_enabled,
+            anthropic_enabled=self.server.config.anthropic_enabled,
+        )
+        self.server.start(cfg)
+        self._update_urls()
+        self._update_running_state()
+
     def _on_protocol_changed(self):
         # 运行时勾选开关即时生效（无需重启）
         if self.server.is_running:
@@ -248,15 +330,17 @@ class ApiPage(QWidget):
 
     @Slot()
     def _on_start(self):
+        host = self.host_combo.currentData()
         cfg = ServerConfig(
-            host=self.server.config.host,
+            host=host,
             port=self.port_spin.value(),
             openai_enabled=self.openai_check.isChecked(),
             anthropic_enabled=self.anthropic_check.isChecked(),
         )
         self.server.config.set(
-            port=cfg.port, openai_enabled=cfg.openai_enabled,
+            host=host, port=cfg.port, openai_enabled=cfg.openai_enabled,
             anthropic_enabled=cfg.anthropic_enabled)
+        self._persist()
         self.server.start(cfg)
         self._update_urls()
         self._update_running_state()

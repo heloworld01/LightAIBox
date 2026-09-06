@@ -56,8 +56,14 @@ def main() -> int:
     server = GatewayServer(gateway)
 
     # 统一 API 服务默认随应用启动，外部工具开箱即可调用。
-    # 使用默认配置（host 127.0.0.1、port 8765，OpenAI / Anthropic 双协议均启用）。
-    server.start(ServerConfig())
+    # 监听地址/端口读 QSettings 持久化值（默认 127.0.0.1、8765），
+    # 用户可在「统一 API」页把监听地址切到 0.0.0.0 供非本机访问。
+    from PySide6.QtCore import QSettings
+    from . import config as _cfg
+    _qset = QSettings()
+    _host = _qset.value(_cfg.SETTINGS_SERVER_HOST, _cfg.DEFAULT_SERVER_HOST)
+    _port = int(_qset.value(_cfg.SETTINGS_SERVER_PORT, _cfg.DEFAULT_SERVER_PORT))
+    server.start(ServerConfig(host=_host, port=_port))
 
     win = MainWindow(gateway, server)
     win.show()

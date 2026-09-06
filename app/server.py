@@ -48,9 +48,11 @@ class ServerConfig:
     anthropic_enabled: bool = True
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def set(self, port=None, openai_enabled=None, anthropic_enabled=None):
+    def set(self, host=None, port=None, openai_enabled=None, anthropic_enabled=None):
         """运行时修改配置（UI 勾选/改端口用），加锁避免与请求读取竞争。"""
         with self._lock:
+            if host is not None:
+                self.host = host
             if port is not None:
                 self.port = port
             if openai_enabled is not None:
