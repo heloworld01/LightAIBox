@@ -497,12 +497,27 @@ class GatewayLLM:
 def _route_intent(input_text: str) -> List[Dict[str, str]]:
     text = input_text.strip()
     has_compare = ("对比" in text or "比较" in text or " vs " in text.lower())
-    has_plan = ("规划" in text or "方案" in text or "计划" in text or "分析" in text)
-    has_report = ("报告" in text or "写" in text or "生成" in text)
+    has_plan = ("规划" in text or "方案" in text or "计划" in text
+                or "分析" in text or "步骤" in text)
+    has_report = ("报告" in text or "写" in text or "生成" in text
+                  or "输出" in text or "文档" in text)
 
     tasks: List[Dict[str, str]] = []
-    if has_compare and ("和" in text or "与" in text or "、" in text):
-        tasks.append({"task": "对请求中涉及的对象做逐项对比分析，给出异同结论。",
+    # 同时表达「分析/规划」与「产出/撰写」两类诉求 → 拆成两个子代理（分别做分析、
+    # 写作），再由 StreamingSuperAgent 的多子任务 LLM 汇总合成最终回答。这让
+    # UI 的「子任务 1/2…」编号标题名副其实，并启用既有的 summary 汇总块。
+    if has_compare and has_report:
+        tasks.append({"task": f"对请求中涉及的对象做逐项对比分析，给出异同结论：{text}",
+                      "agent_type": "reflection"})
+        tasks.append({"task": f"把对比分析的结论汇总成结构化报告/文档：{text}",
+                      "agent_type": "react"})
+    elif has_plan and has_report:
+        tasks.append({"task": f"把下面的问题拆解成步骤并给出可执行方案：{text}",
+                      "agent_type": "plan"})
+        tasks.append({"task": f"基于上面方案，把最终成果撰写/生成为可交付内容：{text}",
+                      "agent_type": "react"})
+    elif has_compare:
+        tasks.append({"task": f"对请求中涉及的对象做逐项对比分析，给出异同结论：{text}",
                       "agent_type": "reflection"})
     elif has_plan:
         tasks.append({"task": f"把下面的问题拆解成步骤并给出可执行方案：{text}",

@@ -347,13 +347,16 @@ class ChatPage(QWidget):
         self.provider_combo.setMinimumWidth(200)
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
-        # 聊天字体大小选择（12~18px，持久化到 QSettings）
+        # 聊天字体大小选择（大/中/小 三档，持久化到 QSettings；内部存像素值）
         self.font_label = QLabel(self.tr("字号", "Size"))
         self.font_label.setProperty("class", "stats-text")
+        # 档位：小=12 / 中=13（默认）/ 大=16。以 px 为唯一单位，三区域（问答气泡 /
+        # 输入框 / 会话列表）经 _font_size 统一，观感一致。
+        self._FONT_PRESETS = [("小", "S", 12), ("中", "M", 13), ("大", "L", 16)]
         self.font_combo = QComboBox()
         self.font_combo.setMinimumWidth(72)
-        for size in (12, 13, 14, 15, 16, 18):
-            self.font_combo.addItem(str(size) + "px", size)
+        for zh, en, size in self._FONT_PRESETS:
+            self.font_combo.addItem(self.tr(zh, en), size)
         idx = self.font_combo.findData(self._font_size)
         self.font_combo.setCurrentIndex(idx if idx >= 0 else 1)
         self.font_combo.currentIndexChanged.connect(self._on_font_changed)
@@ -449,6 +452,7 @@ class ChatPage(QWidget):
         self.input.setFrameShape(QFrame.NoFrame)
         self.input.setObjectName("chatInput")
         self._apply_input_font()
+        self._apply_sidebar_font()
         iv.addWidget(self.input)
 
         foot = QHBoxLayout()
@@ -1142,6 +1146,9 @@ class ChatPage(QWidget):
         pal = _chat_palette()
         tr = self.tr
         parts: list = []
+        # 子任务块总数（排除 summary）。仅多子任务时显示「子任务 N」编号标题；
+        # 单子任务（最常见）直接渲染各步骤，避免冗余的「⚙ 子任务 1」前缀。
+        subtask_count = sum(1 for b in blocks if b.get("kind") != "summary")
         for idx, b in enumerate(blocks):
             kind = b.get("kind")
             if kind == "summary":
@@ -1150,21 +1157,22 @@ class ChatPage(QWidget):
                     parts.append(self._render_markdown(text, font_size))
                 continue
             # ---- 子任务块 ----
-            n = b.get("index", idx + 1)
-            atype = str(b.get("agent_type", "") or "")
-            label = self._AGENT_TYPE_LABELS.get(atype)
-            atype_txt = (tr(label[0], label[1]) if label else atype)
-            title = f"{tr('子任务', 'Subtask')} {n}"
-            if atype_txt:
-                title += f" · {_html.escape(atype_txt)}"
-            # 折叠标题行：默认展开（内联 on* 事件在本模块清洗后不会出现，这里只用
-            # href 链接固定为展开态，不依赖 JS 交互，保证从头到尾可见）。
-            header = (f'<div style="margin:10px 0 4px;padding:2px 8px;'
-                      f'font-weight:600;color:{pal["user_avatar"]};'
-                      f'font-size:{font_size}px;border-left:3px solid '
-                      f'{pal["user_avatar"]};">'
-                      f'⚙ {_html.escape(title)}</div>')
-            parts.append(header)
+            if subtask_count > 1:
+                n = b.get("index", idx + 1)
+                atype = str(b.get("agent_type", "") or "")
+                label = self._AGENT_TYPE_LABELS.get(atype)
+                atype_txt = (tr(label[0], label[1]) if label else atype)
+                title = f"{tr('子任务', 'Subtask')} {n}"
+                if atype_txt:
+                    title += f" · {_html.escape(atype_txt)}"
+                # 折叠标题行：默认展开（内联 on* 事件在本模块清洗后不会出现，这里只用
+                # href 链接固定为展开态，不依赖 JS 交互，保证从头到尾可见）。
+                parts.append(
+                    f'<div style="margin:10px 0 4px;padding:2px 8px;'
+                    f'font-weight:600;color:{pal["user_avatar"]};'
+                    f'font-size:{font_size}px;border-left:3px solid '
+                    f'{pal["user_avatar"]};">'
+                    f'⚙ {_html.escape(title)}</div>')
 
             steps = b.get("steps") or []
             step_htmls: list = []
@@ -1564,19 +1572,26 @@ class ChatPage(QWidget):
             "When on, the model shows its reasoning before the answer"))
 
     def _apply_input_font(self):
-        """把当前字号应用到输入框，使其与气泡字号保持一致。"""
+        """把当前字号应用到输入框，使其与气泡字号保持一致（统一用像素 px）。"""
         font = QFont(self.input.font())
-        font.setPointSize(self._font_size)
+        font.setPixelSize(self._font_size)
         self.input.setFont(font)
 
+    def _apply_sidebar_font(self):
+        """把当前字号应用到会话列表侧边栏，与气泡/输入框观感一致（统一 px）。"""
+        font = QFont(self.sess_list.font())
+        font.setPixelSize(self._font_size)
+        self.sess_list.setFont(font)
+
     def _on_font_changed(self):
-        """字号切换：持久化，应用到输入框并重放气泡。"""
+        """字号切换：持久化，应用到输入框/侧边栏并重放气泡。"""
         data = self.font_combo.currentData()
         if data is None:
             return
         self._font_size = int(data)
         self._settings.setValue("chat/font_size", self._font_size)
         self._apply_input_font()
+        self._apply_sidebar_font()
         self._reset_history_view(force=True)
 
     def _on_toggle_thinking(self):
@@ -2048,6 +2063,10 @@ class ChatPage(QWidget):
         self.header.title_label.setText(self.tr("对话", "Chat"))
         self.provider_label.setText(self.tr("模型", "Model"))
         self.font_label.setText(self.tr("字号", "Size"))
+        # 字号档位文案随语言切换：重设 大/中/小（英文 S/M/L）的项文本
+        for i, (zh, en, _size) in enumerate(self._FONT_PRESETS):
+            if i < self.font_combo.count():
+                self.font_combo.setItemText(i, self.tr(zh, en))
         # Auto 项文案随语言刷新：签名去重会因 provider 集合未变而跳过，故先
         # 重置签名强制重建，刷新首项「自动（自适应调度）」的新语言文案。
         self._provider_sig = None
