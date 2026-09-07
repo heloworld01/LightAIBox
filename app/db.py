@@ -3,6 +3,7 @@
 使用 Python 内置 sqlite3，文件位于 app/data/lightbox.db。
 所有写操作自动 commit。线程安全：每次操作使用独立连接。
 """
+import json
 import os
 import sqlite3
 from typing import List, Optional
@@ -83,6 +84,36 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE providers ADD COLUMN multimodal "
                 "INTEGER NOT NULL DEFAULT 0")
+        # 对话页：多会话持久化（会话表 + 会话消息表）。summary 存该会话被压缩出的
+        # 「上文摘要」，发送时注入为 system 消息；消息 content/meta 为 JSON 文本。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL DEFAULT '新对话',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                meta TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        # 迁移：旧库补 chat_sessions / chat_messages 索引（新表已有；此处幂等兜底）
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_session "
+            "ON chat_messages(session_id, seq)")
         conn.commit()
 
 
@@ -351,3 +382,141 @@ class CallLogStore:
             "completion_tokens": row["completion_tokens"],
             "total_tokens": row["total_tokens"],
         }
+
+
+# --------------------------------------------------------------------------- #
+# 对话会话（多会话持久化 + 上下文摘要）
+# --------------------------------------------------------------------------- #
+
+def _now_text() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class ChatStore:
+    """「对话」页多会话的持久化。
+
+    - chat_sessions：会话元信息（标题 / 压缩摘要 / 时间）。
+    - chat_messages：每会话按 seq 顺序的消息；content 为 JSON（文本 str 或图片
+      blocks 列表），meta 为 JSON（_meta / _thinking / _tools / _agent_blocks）。
+    """
+
+    # -- 会话 ----------------------------------------------------------- #
+    def create_session(self, title: str = "新对话") -> int:
+        now = _now_text()
+        with _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO chat_sessions(title, created_at, updated_at) "
+                "VALUES (?, ?, ?)", (title, now, now))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def list_sessions(self) -> List[dict]:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, title, summary, created_at, updated_at "
+                "FROM chat_sessions ORDER BY updated_at DESC, id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def rename_session(self, session_id: int, title: str) -> None:
+        with _connect() as conn:
+            conn.execute("UPDATE chat_sessions SET title = ? WHERE id = ?",
+                         (title, session_id))
+            conn.commit()
+
+    def delete_session(self, session_id: int) -> None:
+        with _connect() as conn:
+            conn.execute("DELETE FROM chat_messages WHERE session_id = ?",
+                         (session_id,))
+            conn.execute("DELETE FROM chat_sessions WHERE id = ?",
+                         (session_id,))
+            conn.commit()
+
+    def touch(self, session_id: int) -> None:
+        now = _now_text()
+        with _connect() as conn:
+            conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+                         (now, session_id))
+            conn.commit()
+
+    def set_summary(self, session_id: int, text: str) -> None:
+        with _connect() as conn:
+            conn.execute("UPDATE chat_sessions SET summary = ? WHERE id = ?",
+                         (text, session_id))
+            conn.commit()
+
+    def get_summary(self, session_id: int) -> str:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT summary FROM chat_sessions WHERE id = ?",
+                (session_id,)).fetchone()
+        return row["summary"] if row else ""
+
+    # -- 消息 ----------------------------------------------------------- #
+    def max_seq(self, session_id: int) -> int:
+        """返回该会话当前最大 seq；无消息返回 0。"""
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS m FROM chat_messages "
+                "WHERE session_id = ?", (session_id,)).fetchone()
+        return int(row["m"])
+
+    def add_message(self, session_id: int, seq: int, role: str,
+                    content, meta: Optional[dict] = None) -> None:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_messages(session_id, seq, role, content, "
+                "meta, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, seq, role,
+                 json.dumps(content, ensure_ascii=False),
+                 json.dumps(meta or {}, ensure_ascii=False),
+                 _now_text()))
+            conn.commit()
+
+    def load_messages(self, session_id: int) -> List[dict]:
+        """还原成 ChatPage 消费的消息 dict 列表。
+
+        每条为 {role, content, time, **meta}——meta 里的 _meta/_thinking/_tools/
+        _agent_blocks 平铺到顶层，与 ChatSession.messages 的现有结构一致。
+        """
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content, meta, created_at FROM chat_messages "
+                "WHERE session_id = ? ORDER BY seq ASC", (session_id,)).fetchall()
+        out: List[dict] = []
+        for r in rows:
+            try:
+                content = json.loads(r["content"])
+            except (ValueError, TypeError):
+                content = r["content"]
+            # time 还原成数值时间戳：UI 用 `ts - last_ts > 300` 判断时间分隔条且需格式化，
+            # 必须给 float（存库为人类可读文本，读回时解析）。
+            try:
+                import datetime as _dt
+                ts = _dt.datetime.strptime(
+                    r["created_at"], "%Y-%m-%d %H:%M:%S").timestamp()
+            except Exception:
+                ts = 0.0
+            msg: dict = {"role": r["role"], "content": content, "time": ts}
+            try:
+                meta = json.loads(r["meta"] or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+            if isinstance(meta, dict):
+                msg.update(meta)
+            out.append(msg)
+        return out
+
+    def delete_range(self, session_id: int, min_seq: int) -> None:
+        """删除该会话 seq >= min_seq 的消息（min_seq=0 清空全部）。"""
+        with _connect() as conn:
+            conn.execute("DELETE FROM chat_messages WHERE session_id = ? AND seq >= ?",
+                         (session_id, min_seq))
+            conn.commit()
+
+    def count_messages(self, session_id: int) -> int:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id = ?",
+                (session_id,)).fetchone()
+        return int(row["n"])

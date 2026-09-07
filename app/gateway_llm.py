@@ -254,6 +254,32 @@ class GatewayLLM:
         self.max_tokens = max_tokens
         self.model = ""          # 由 Gateway 自适应调度决定，这里不固定
         self.provider = "gateway"
+        # 整轮编排的 token 用量累计：智能体一次问答会触发多次底层 LLM 调用
+        #（各子代理的每步 + 多子任务的最终汇总），全部累加到这里，供上层
+        # AgentChatSession 组装最终 ClientResult 的真实 token 数（此前硬编码 0）。
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._calls = 0
+
+    # -- 整轮 token 用量累计 ------------------------------------------------ #
+    def _accumulate(self, result) -> None:
+        """把一次底层 Gateway 调用的 token 用量累进本轮合计。"""
+        if result is not None:
+            self._prompt_tokens += result.prompt_tokens or 0
+            self._completion_tokens += result.completion_tokens or 0
+            self._calls += 1
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        return self._prompt_tokens
+
+    @property
+    def total_completion_tokens(self) -> int:
+        return self._completion_tokens
+
+    @property
+    def total_calls(self) -> int:
+        return self._calls
 
     # -- 内部：按协议把消息喂给 Gateway ------------------------------------- #
     def _invoke(self, messages: List[Dict], tools: Optional[List[Dict]] = None,
@@ -286,6 +312,7 @@ class GatewayLLM:
         """非流式调用，返回 LLMResponse。"""
         LLMResponse, _, _ = _LightAgentsLLM_types()
         result, _, _ = self._invoke(messages, **kwargs)
+        self._accumulate(result)
         return LLMResponse(
             content=result.content or "",
             model=result.model if hasattr(result, "model") else "",
@@ -309,6 +336,7 @@ class GatewayLLM:
                 msgs, tools=_fill_tool_schemas(tools), **kwargs)
         else:
             result, _, _ = self._invoke(messages, tools=tools, **kwargs)
+        self._accumulate(result)
 
         tool_calls = [
             ToolCall(id=b.tool_id, name=b.tool_name,
@@ -361,6 +389,7 @@ class GatewayLLM:
                     piece = it.send(None)
                 except StopIteration as e:
                     result, _pid, _rproto = e.value
+                    self._accumulate(result)
                     break
                 if piece:
                     text.append(piece)
@@ -384,6 +413,7 @@ class GatewayLLM:
                 msgs, tools=_fill_tool_schemas(tools), **kwargs)
         else:
             result, _, _ = self._invoke(messages, tools=tools, **kwargs)
+        self._accumulate(result)
 
         content = result.content or ""
         if content:
@@ -419,7 +449,9 @@ class GatewayLLM:
             while True:
                 try:
                     piece = next(it)
-                except StopIteration:
+                except StopIteration as e:
+                    # 捕获最终 ClientResult，把 token 用量累进整轮合计（summary 阶段也走这里）
+                    self._accumulate(e.value)
                     break
                 if piece:
                     yield piece
@@ -560,6 +592,8 @@ class StreamingSuperAgent:
         # 懒加载 LightAgents 的 Config / factory，避免构造期 import 失败
         self._config = config
         self._subagent_factory = None
+        # 最近一轮编排的结构化步骤产出（arun_stream 填充，见其 docstring）
+        self.blocks: List[Dict[str, Any]] = []
 
     def _lazy_setup(self):
         _ensure_lightagents()
@@ -654,11 +688,22 @@ class StreamingSuperAgent:
         return raw.strip()
 
     # ------------------------------------------------------------------ #
-    async def arun_stream(self, input_text: str, **kwargs):
+    async def arun_stream(self, input_text: str, history_context: str = "",
+                          **kwargs):
         """异步流式编排：逐 token yield（含 THINK_TAG/TOOL_TAG 带外信号）。
+
+        ``history_context`` 为本会话此前的对话摘要（见 AgentChatSession._build_history_context），
+        会拼接到每个子代理的系统提示尾部，让各轮问答共享前文记忆（Fix 1）。它只作
+        提示注脚，不影响 ``_route_intent`` 的意图路由——路由仍只基于当轮 ``input_text``。
 
         ChatPage 的 _ChatWorker 在后台 QThread 里跑同步循环消费；本生成器应在
         agent_bridge 里经一个独立 asyncio 事件循环被消费，把每段增量上抛。
+
+        并行地在 ``self.blocks`` 里构建**结构化步骤**（供 UI 分块展示）：
+        - 每个子任务（子代理）为一个 ``subtask`` 块，包含其内部按 ReAct 步骤
+          划分的 ``steps``（每步的模型正文 / 思考 / 工具活动）与最终 ``answer``；
+        - 多子任务时追加一个 ``summary`` 块承载 LLM 汇总的最终回答。
+        普通文本 / THINK / TOOL 事件仍按原样 yield，保证直播流式体验不变。
         """
         _ensure_lightagents()
         from light_agents.core.streaming import StreamEventType
@@ -668,25 +713,60 @@ class StreamingSuperAgent:
         if not subtasks:
             subtasks = [{"task": input_text, "agent_type": "react"}]
 
+        # 结构化产出：清空（同一实例可能被再次驱动）
+        self.blocks: List[Dict[str, Any]] = []
         results: List[Dict[str, Any]] = []
+
+        from .agent_bridge import (SUB_OPEN, STEP_OPEN, SUB_ANSWER, SUB_END,
+                                   _tool_event)
 
         for subtask in subtasks:
             agent_type = subtask.get("agent_type", "react")
             task = subtask.get("task", "") or input_text
+            # 子任务块：标题信息 + 内部步骤列表 + 最终答案
+            sub_block: Dict[str, Any] = {
+                "kind": "subtask",
+                "index": len(self.blocks) + 1,
+                "agent_type": agent_type,
+                "steps": [],
+                "answer": "",
+            }
+            # 流式：通知 UI 打开一个子任务块（随后步骤/文本经 STEP_OPEN 归属其下）
+            yield SUB_OPEN + json.dumps({
+                "index": sub_block["index"],
+                "agent_type": agent_type,
+            }, ensure_ascii=False) + "\x01"
             try:
                 subagent = self._subagent_factory(agent_type)
             except Exception as exc:  # noqa: BLE001
-                yield f"\n（子代理创建失败：{exc}）\n"
+                msg = f"（子代理创建失败：{exc}）"
+                yield SUB_ANSWER + json.dumps({"answer": msg},
+                                              ensure_ascii=False) + "\x01"
+                yield SUB_END
+                sub_block["answer"] = msg
+                self.blocks.append(sub_block)
                 results.append({"task": task, "agent_type": agent_type,
                                 "success": False, "summary": str(exc)})
                 continue
 
             collected: List[str] = []
+            # 当前正在累积的 ReAct 步骤：{n, text[], thinking[], tools[]}
+            cur_step: dict | None = None
             # LightAgents 只在「钩子」里发工具开始事件（on_tool_call），不 yield 进
             # 生成器；这里把钩子接进来记录（tool_call_id -> (name, args)），并在随后的
             # TOOL_CALL_FINISH 到达前先补发一条「call」事件——这样 UI 能看到
             # 「🔧 正在调用 X（参数…）」这一步，而不是只有完成态。
             pending_calls: Dict[str, tuple] = {}
+
+            def _flush_step():
+                """把已累积的当前步骤写入子任务块（有内容才保留）。"""
+                nonlocal cur_step
+                if cur_step is not None and (
+                        cur_step["text"] or cur_step["thinking"] or cur_step["tools"]):
+                    cur_step["text"] = "".join(cur_step["text"])
+                    cur_step["thinking"] = "".join(cur_step["thinking"]).strip()
+                    sub_block["steps"].append(cur_step)
+                cur_step = None
 
             async def _on_tool_call(event):  # noqa: ANN001 —— AgentEvent
                 d = event.data or {}
@@ -695,39 +775,83 @@ class StreamingSuperAgent:
                     pending_calls[tid] = (d.get("tool_name", "?"),
                                           d.get("args", {}) or {})
 
+            def _add_tool(name, kind, ok, detail):
+                """把一条工具活动记入当前步骤（与 ChatPage._pending_tools 同口径）。"""
+                if cur_step is None:
+                    return
+                cur_step["tools"].append((name, kind, ok, detail))
+
+            # 注入此前对话（Fix 1）：ReAct 等子代理每轮重建 [system, user] 消息，这里在
+            # 调用前把 history_context 拼进其系统提示，使得当轮消息里带上历史记忆。
+            if history_context and hasattr(subagent, "system_prompt"):
+                base = subagent.system_prompt or ""
+                subagent.system_prompt = base + ("\n\n" if base else "") + history_context
+
             try:
                 async for evt in subagent.arun_stream(
                         task, on_tool_call=_on_tool_call, **kwargs):
-                    from .agent_bridge import _tool_event
-                    if evt.type == StreamEventType.TOOL_CALL_FINISH:
+                    et = evt.type
+                    if et == StreamEventType.STEP_START and evt.data:
+                        # 新一步开始：把上一步收尾，开启当前步，并通知 UI 开新步骤块
+                        _flush_step()
+                        cur_step = {"n": int(evt.data.get("step", 0) or 0),
+                                    "text": [], "thinking": [], "tools": []}
+                        yield STEP_OPEN + json.dumps(
+                            {"n": cur_step["n"]}, ensure_ascii=False) + "\x01"
+                    if et == StreamEventType.TOOL_CALL_FINISH:
                         tid = (evt.data or {}).get("tool_call_id", "")
                         if tid in pending_calls:
                             name, args = pending_calls.pop(tid)
                             yield _tool_event("call", name=name, id=tid, args=args)
+                            # 记录进当前步骤的工具活动（与直播的「call」行同口径），
+                            # 使步骤块内 call+result 成对出现，UI 可合并为完成态。
+                            _add_tool(name, "call", True, str(args or ""))
                     for piece in self._emit_event(evt):
                         yield piece
-                    if evt.type == StreamEventType.LLM_CHUNK:
-                        collected.append(evt.data.get("chunk", "")
-                                         or evt.data.get("text", ""))
-                    elif evt.type == StreamEventType.AGENT_FINISH:
-                        # 最终答案可能只经 AGENT_FINISH.result 带回：当模型经 Finish 工具
-                        # 收尾的那一轮无 LLM_CHUNK 正文（见 light_agents react_agent），
-                        # 若这里不补吐，对话页会一直空白。已逐 token 流过（collected 已含
-                        # 全文）的路径则不重复吐；补吐时按 ~120 字分片并以微小间隔吐出，
-                        # 避免尾部整段瞬间跳出（结合流式防抖自然过渡）。
+                    if et == StreamEventType.LLM_CHUNK:
+                        chunk = evt.data.get("chunk", "") or evt.data.get("text", "")
+                        collected.append(chunk)
+                        if cur_step is not None:
+                            cur_step["text"].append(chunk)
+                    elif et == StreamEventType.THINKING:
+                        think = (evt.data.get("thinking", "")
+                                 or evt.data.get("thinking_text", ""))
+                        if cur_step is not None and think:
+                            cur_step["thinking"].append(think)
+                    elif et == StreamEventType.TOOL_CALL_START:
+                        _add_tool(str(evt.data.get("tool_name", "?")),
+                                  "call", True,
+                                  str(evt.data.get("args", {}) or {}))
+                    elif et == StreamEventType.TOOL_CALL_FINISH:
+                        rtext = str(evt.data.get("result", "") or "")
+                        _add_tool(str(evt.data.get("tool_name", "?")),
+                                  "result", not rtext.startswith("❌"), rtext)
+                    elif et == StreamEventType.AGENT_FINISH:
+                        # 最终答案可能只经 AGENT_FINISH.result 带回（如模型经 Finish
+                        # 工具收尾的那一轮无 LLM_CHUNK 正文）；此处记入子任务 answer，
+                        # 由 UI 归到该子任务块内（不重复吐成正文文本）。
                         result = ((evt.data or {}).get("result", "") or "").strip()
-                        if result and result not in "".join(collected):
-                            import asyncio as _ai
-                            step = max(1, 120)
-                            for _i in range(0, len(result), step):
-                                yield result[_i:_i + step]
-                                await _ai.sleep(0.012)
+                        sub_block["answer"] = result
+                # 子代理跑完：收尾最后一个步骤，并把最终答案送达 UI 后关闭本子任务块
+                _flush_step()
+                if sub_block["answer"]:
+                    yield SUB_ANSWER + json.dumps(
+                        {"answer": sub_block["answer"]},
+                        ensure_ascii=False) + "\x01"
+                yield SUB_END
             except Exception as exc:  # noqa: BLE001
-                msg = f"\n（子任务执行失败：{exc}）\n"
-                yield msg
+                _flush_step()
+                msg = f"（子任务执行失败：{exc}）"
+                yield SUB_ANSWER + json.dumps(
+                    {"answer": sub_block["answer"] or msg},
+                    ensure_ascii=False) + "\x01"
+                yield SUB_END
+                sub_block["answer"] = sub_block["answer"] or msg
+                self.blocks.append(sub_block)
                 results.append({"task": task, "agent_type": agent_type,
                                 "success": False, "summary": str(exc)})
                 continue
+            self.blocks.append(sub_block)
             results.append({
                 "task": task, "agent_type": agent_type,
                 "success": True, "summary": "".join(collected),
@@ -738,12 +862,27 @@ class StreamingSuperAgent:
             return
 
         parts = _synthesize_parts(input_text, results)
+        summary_text: str = parts["joined"]
         try:
+            summary_prompt = parts["prompt"]
+            # 多子任务汇总同样携带此前对话，避免汇总时丢失前文（Fix 1）
+            if history_context:
+                summary_prompt = (f"此前对话：\n{history_context}\n\n"
+                                  + summary_prompt)
+            summary_parts: List[str] = []
             for chunk in self.llm.stream_invoke(
-                [{"role": "user", "content": parts["prompt"]}]):
+                [{"role": "user", "content": summary_prompt}]):
+                summary_parts.append(chunk)
                 yield chunk
+            if summary_parts:
+                summary_text = "".join(summary_parts)
         except Exception as exc:  # noqa: BLE001
             yield "\n\n" + parts["joined"]
+        # 多子任务的 LLM 汇总：作为「最终回答」块，供 UI 置顶展示
+        self.blocks.append({
+            "kind": "summary",
+            "text": summary_text.strip() if summary_text.strip() else "",
+        })
 
     def _emit_event(self, evt):
         """把单个 StreamEvent 映射回 token 通道的字符串片段列表。"""
@@ -893,6 +1032,16 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
     try:
         from light_agents.tools.builtin.date_time_tool import DateTimeTool  # noqa: PLC0415
         date_time_tool = DateTimeTool()
+        # 职责去重叠：DateTimeTool 原描述声称「大约在哪里 / 推断地点」，与定位工具
+        # get_current_location 语义重叠——当定位工具改非驻留（不每轮可见）时，模型会
+        # 把「我在哪/位置」误路由给仅按本地时区粗推的时间工具。这里把它的对外描述
+        # 收紧为纯时间/日期/时区，位置问题才会上交 FindTools → get_current_location。
+        date_time_tool.description = (
+            "获取当前本地日期、时间、星期与时区。需要知道「现在几点 / 今天几号 / "
+            "星期几 / 时区」时调用。注意：本工具不做地理定位，无法给出所在城市/地址；"
+            "若要判断当前位置请检索并使用定位类工具（如 get_current_location）或先经 "
+            "FindTools 发现。"
+        )
     except Exception:  # noqa: BLE001 —— 内置工具缺失则回退到桌面版
         date_time_tool = None
 
@@ -947,6 +1096,22 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
         except Exception:  # noqa: BLE001 —— paramiko 缺失/框架不兼容则跳过注册
             ssh_tool = None
 
+    # 浏览器自动化（Playwright，联动本机 Chrome）：打开网页 / 抓取 / 点击 / 填表 / 截图。
+    # 与 SSH 同属「会改外部状态」的工具，需过 approval 确认闸门；非常驻，经 FindTools
+    # 检索（打开网页 / 浏览器 / 访问网址 等）按需发现后再注入 schema。
+    browser_tool = None
+    if approval is not None:
+        try:
+            from light_agents.tools.builtin.browser_tool import BrowserTool  # noqa: PLC0415
+            browser_tool = BrowserTool(
+                approval=lambda action, params: approval.await_approval(
+                    {"action": "browser", "browser_action": action, "params": params}),
+            )
+            if registry.get_tool("browser") is None:
+                registry.register_tool(browser_tool)
+        except Exception:  # noqa: BLE001 —— playwright 缺失/框架不兼容则跳过注册
+            browser_tool = None
+
     # 工具发现：目录 + FindTools 元工具（常驻）
     catalog = ToolCatalog(registry)
     from light_agents.tools.builtin.find_tools_tool import FindToolsTool
@@ -962,11 +1127,13 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
     )
     for t in desktop.list_tools():
         if date_time_tool is not None and t["name"] == "get_current_time":
+            # 标签去掉「地点/location」：避免 FindTools 把位置类检索命中到时间工具，
+            # 位置语义与 get_current_location 冲突。
             catalog.add_entry(
                 name=date_time_tool.name,
                 description=date_time_tool.description,
-                tags=["时间", "日期", "时区", "地点", "几点", "几号",
-                      "time", "date", "datetime", "location"],
+                tags=["时间", "日期", "时区", "几点", "几号",
+                      "time", "date", "datetime", "timezone"],
                 category="desktop", resident=True,
             )
             continue
@@ -987,15 +1154,17 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
             resident=False,
         )
     if ip_location_tool is not None:
-        # 常驻：模型第 1 轮即可见可调（「我在哪 / 当前地理位置」无需先经 FindTools
-        # 发现）。IP 定位无参数、联网只读、上下文占用极低，适合直接内置。
+        # 非驻留：不把 get_current_location 每轮都喂给模型，避免模型在「问某城市天气」
+        # 这类已含城市名的问题下仍多余地先做 IP 定位。weather 缺 city 时由自身内置的
+        # location_provider（get_city）在内部推断，无需独立走到此工具；仅当用户明确问
+        # 「我在哪 / 当前地理位置」之类问题时，模型才经 FindTools 检索到它。
         catalog.add_entry(
             name=ip_location_tool.name,
             description=ip_location_tool.description,
             tags=["位置", "定位", "IP", "我在哪", "城市", "省市", "where",
                   "location", "ip", "geo"],
             category="web",
-            resident=True,
+            resident=False,
         )
     if file_tools is not None:
         for t in file_tools.list_tools():
@@ -1014,6 +1183,21 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
             tags=["ssh", "远程", "服务器", "主机", "命令行", "执行命令", "部署",
                   "remote", "server", "shell", "deploy"],
             category="remote",
+            resident=False,
+        )
+    if browser_tool is not None:
+        # 浏览器非常驻：经 FindTools 检索（打开网页 / 浏览器 / 访问网址 / 截图 等）
+        # 发现后按需激活，动作类（goto/click/fill 等）过 approval 确认闸门。
+        catalog.add_entry(
+            name=browser_tool.name,
+            description=browser_tool.description,
+            tags=["浏览器", "打开网页", "网页", "网址", "访问", "浏览器自动化",
+                  "截图", "网页截图", "点击", "填表", "打开网页", "访问网址",
+                  "打开浏览器", "打开网站", "网页访问", "浏览", "上网",
+                  "browser", "web", "url", "open website", "open url",
+                  "open", "navigate", "visit", "screenshot", "browse"],
+
+            category="web",
             resident=False,
         )
     return registry, catalog

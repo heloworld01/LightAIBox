@@ -148,8 +148,14 @@ class ClientResult:
     completion_tokens: int
     elapsed_ms: int
     tokens_per_sec: float
+    # 该结果背后的底层 LLM 调用次数（智能体模式 = 整轮各 ReAct 步 + 汇总的调用总和，
+    # 供 UI 展示「N 次调用 · 提示 X + 输出 Y」以解释总 token 数值的构成）。
+    calls: int = 0
     blocks: list = field(default_factory=list)  # List[ContentBlock]
     stop_reason: str = ""  # 上游返回的结束原因（如 end_turn / tool_use / max_tokens）
+    # 智能体模式的结构化产出：List[dict]，每项为「子任务」或「汇总」块（见
+    # gateway_llm.StreamingSuperAgent.blocks），供 ChatPage 分块渲染各步骤。
+    agent_blocks: list = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:

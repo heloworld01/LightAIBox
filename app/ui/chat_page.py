@@ -29,7 +29,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QTextEdit,
@@ -38,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import config
+from ..db import ChatStore
 from ..gateway import Gateway
 from ..chat_session import ChatSession
 from .i18n import LanguageManager
@@ -45,10 +51,22 @@ from .theme_manager import ThemeManager
 from .widgets import MessageBox, SectionHeader
 from ..approval import ApprovalCoordinator
 from ..client import THINK_TAG, THINK_END_TAG
-from ..agent_bridge import TOOL_TAG, TOOL_END_TAG
+from ..agent_bridge import (TOOL_TAG, TOOL_END_TAG, SUB_OPEN, STEP_OPEN,
+                            SUB_ANSWER, SUB_END)
 
 _ROLE_USER = "user"
 _ROLE_ASSISTANT = "assistant"
+
+# 智能体结构化流式：把一段 piece 切分为「带外结构 token」与普通文本。
+# 结构 token：sub/step/sans 开事件（后跟 JSON，以 \x01 收尾）、/sub 收尾事件；
+# 以及既有的 think/tool 完整段。文本块不属于任何 token，归属当前开启的步骤/子任务。
+_AGENT_TOKEN_RE = _re.compile(
+    r"(\x01sub\x01[^\x01]*\x01"
+    r"|\x01step\x01[^\x01]*\x01"
+    r"|\x01sans\x01[^\x01]*\x01"
+    r"|\x01/sub\x01"
+    r"|\x01think\x01.*?\x01/think\x01"
+    r"|\x01tool\x01.*?\x01/tool\x01)")
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +104,21 @@ def _chat_palette():
     }
 
 
+def _short_repr(obj, limit: int = 500):
+    """把审批弹窗里的参数压缩成单行可读文本（截断超长内容，避免撑爆对话框）。"""
+    if isinstance(obj, dict):
+        parts = []
+        for k, v in obj.items():
+            parts.append(f"{k}={_short_repr(v, 120)}")
+        return "{" + ", ".join(parts) + "}"
+    if isinstance(obj, (list, tuple)):
+        return "[" + ", ".join(_short_repr(v, 80) for v in obj) + "]"
+    s = str(obj)
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
+
+
 class _ChatWorker(QThread):
     """独立线程消费 Gateway.chat_stream 或智能体会话，把增量经信号送回主线程。
 
@@ -101,7 +134,8 @@ class _ChatWorker(QThread):
 
     def __init__(self, gateway: Gateway, messages: list,
                  provider_id=None, thinking_enabled: bool = False,
-                 agent_mode: bool = False, approval=None, parent=None):
+                 agent_mode: bool = False, approval=None,
+                 agent_session=None, parent=None):
         super().__init__(parent)
         self._gateway = gateway
         self._messages = messages
@@ -110,15 +144,20 @@ class _ChatWorker(QThread):
         self._agent_mode = agent_mode
         # 智能体写文件的运行时授权协调器（跑在主线程，跨线程经 Qt 信号弹窗）
         self._approval = approval
+        # 跨轮复用的智能体会话（Fix 3）：由 ChatPage 持有并沿多轮共享同一个实例，
+        # 使工具激活状态与跨轮历史上下文得以保持；为 None 时每轮新建（无记忆）。
+        self._agent_session = agent_session
         self._stop = False
 
     def run(self) -> None:
         try:
             if self._agent_mode:
-                from ..agent_bridge import AgentChatSession
-                session = AgentChatSession(
-                    self._gateway, provider_id=self._provider_id,
-                    approval=self._approval)
+                session = self._agent_session
+                if session is None:
+                    from ..agent_bridge import AgentChatSession
+                    session = AgentChatSession(
+                        self._gateway, provider_id=self._provider_id,
+                        approval=self._approval)
                 it = session.chat_stream(
                     self._messages, thinking_enabled=self._thinking_enabled)
             else:
@@ -199,14 +238,25 @@ class ChatPage(QWidget):
         super().__init__(parent)
         self.gateway = gateway
         self.tr = LanguageManager().tr
+        self._settings = QSettings("LightAIBox", "LightAIBox")
+        # 多会话持久化存储（SQLite）；self.session 为当前活动会话
+        self._store = ChatStore()
         self.session = ChatSession()
+        # 侧栏展示用的会话元信息列表（来自 store.list_sessions()）
+        self._sessions: list = []
+        # 上下文预算（QSettings 覆盖默认）：发给模型的对话超此值自动裁最旧
+        self._context_tokens = int(self._settings.value(
+            "chat/context_tokens", config.CHAT_CONTEXT_TOKENS))
 
         # 聊天字体大小（QSettings 持久化，默认 13px）
-        self._settings = QSettings("LightAIBox", "LightAIBox")
         self._font_size = self._settings.value("chat/font_size", 13, type=int)
 
         # 后台生成线程；_pending_assistant 累积当前这条助手回复的文本。
         self._worker: _ChatWorker | None = None
+        # 智能体模式的跨轮复用会话（Fix 3）：沿当前对话多轮共享，使工具激活状态与
+        # 跨轮历史记忆得以保持；切换/新建/清空会话时置 None 重建（新对话=新记忆）。
+        self._agent_session = None
+        self._agent_session_sid: int | None = None
         # 被停止但仍未结束的线程会挂这里回收，避免运行中的 QThread 被 GC 销毁崩溃。
         self._zombie_workers: list = []
         self._zombie_timer = QTimer(self)
@@ -232,6 +282,14 @@ class ChatPage(QWidget):
         self._pending_thinking: list = []
         # 智能体模式：本轮已发生的工具活动（按发生顺序的 (name, kind, ok, args/text)）
         self._pending_tools: list = []
+        # 智能体「结构化步骤」的流式累积状态：已收尾的子任务块、当前正开的子任务/
+        # 步骤、以及子任务外的根文本（多子任务的 LLM 汇总）。流式期间据此分块渲染，
+        # 使各步骤的回答与其步骤同步出现，而非等整轮结束才归并。
+        self._pending_blocks: list = []
+        self._cur_sub: dict | None = None
+        self._cur_step: dict | None = None
+        self._root: list = []
+        self._structured: bool = False
         # 智能体写文件的运行时授权：工具线程请求 → 主线程弹确认框 → 写回结果。
         self._approval = ApprovalCoordinator(self)
         self._approval.approval_requested.connect(self._on_approval_requested)
@@ -245,6 +303,13 @@ class ChatPage(QWidget):
         # 助手头像：打包 logo.png 读成 data URI（圆形裁切展示），避免每次渲染重读盘。
 
         self._build_ui()
+        # 会话侧栏显隐（QSettings 记忆偏好，默认显示）
+        self._sidebar_visible = self._settings.value(
+            "chat/sidebar_visible", True, type=bool)
+        self._apply_sidebar_visible()
+        # 载入默认会话（最近会话或新建）并填充侧栏
+        self._init_current_session()
+        self.refresh_sidebar()
         self._update_think_btn_text()
         self._update_agent_btn_text()
         self.refresh_providers()
@@ -263,8 +328,15 @@ class ChatPage(QWidget):
     # UI
     # ------------------------------------------------------------------ #
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
+        # 左右结构：左侧会话边栏 + 右侧聊天（头部/记录/输入）
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 16, 12, 16)
+        outer.setSpacing(12)
+        self._sidebar = self._build_sidebar()
+        outer.addWidget(self._sidebar)
+        _right = QWidget()
+        root = QVBoxLayout(_right)
+        root.setContentsMargins(4, 0, 4, 0)
         root.setSpacing(12)
 
         # 顶行：标题（左）+ provider 选择（右），底部细分隔线
@@ -307,6 +379,12 @@ class ChatPage(QWidget):
         tl = QHBoxLayout(top)
         tl.setContentsMargins(0, 0, 0, 0)
         tl.setSpacing(12)
+        # 会话侧栏显隐切换（状态持久化）
+        self.toggle_sidebar_btn = QPushButton("☰")
+        self.toggle_sidebar_btn.setProperty("class", "ghost")
+        self.toggle_sidebar_btn.setFixedWidth(36)
+        self.toggle_sidebar_btn.clicked.connect(self._on_toggle_sidebar)
+        tl.addWidget(self.toggle_sidebar_btn)
         tl.addWidget(self.header.title_label, 1)
         tl.addWidget(self.provider_label)
         tl.addWidget(self.provider_combo)
@@ -409,9 +487,238 @@ class ChatPage(QWidget):
 
         iv.addLayout(foot)
         root.addWidget(input_panel)
+        outer.addWidget(_right, 1)
 
         # 输入框内 Ctrl+Enter 发送
         self.input.installEventFilter(self)
+
+    # ------------------------------------------------------------------ #
+    # 会话侧边栏
+    # ------------------------------------------------------------------ #
+    def _build_sidebar(self) -> QFrame:
+        """左侧会话边栏：新建按钮 + 会话列表（右键重命名/删除）。"""
+        panel = QFrame()
+        panel.setProperty("class", "panel")
+        panel.setFixedWidth(200)
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(8, 8, 8, 8)
+        pl.setSpacing(8)
+
+        self.new_btn = QPushButton(self.tr("＋ 新建会话", "＋ New"))
+        self.new_btn.setProperty("class", "primary")
+        self.new_btn.setToolTip(
+            self.tr("开始一段新对话", "Start a new conversation"))
+        self.new_btn.clicked.connect(self._on_new_session)
+        pl.addWidget(self.new_btn)
+
+        head = QLabel(self.tr("会话", "Sessions"))
+        head.setProperty("class", "stats-text")
+        pl.addWidget(head)
+
+        self.sess_list = QListWidget()
+        self.sess_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sess_list.customContextMenuRequested.connect(self._on_session_menu)
+        self.sess_list.itemClicked.connect(self._on_session_clicked)
+        pl.addWidget(self.sess_list, 1)
+        return panel
+
+    def _apply_sidebar_visible(self) -> None:
+        """按持久化状态应用侧栏显隐，并同步切换按钮外观。"""
+        self._sidebar.setVisible(self._sidebar_visible)
+        # 展开态显示收起方向箭头，折叠态显示汉堡图标，提示点击动作
+        self.toggle_sidebar_btn.setText("❮" if self._sidebar_visible else "☰")
+        self.toggle_sidebar_btn.setToolTip(
+            self.tr("显示/隐藏会话列表", "Show/Hide session list"))
+
+    @Slot()
+    def _on_toggle_sidebar(self) -> None:
+        """切换会话侧栏显隐（偏好持久化）。"""
+        self._sidebar_visible = not self._sidebar_visible
+        self._settings.setValue("chat/sidebar_visible", self._sidebar_visible)
+        self._apply_sidebar_visible()
+
+    def _init_current_session(self) -> None:
+        """启动时选出默认会话：有历史取最近会话，否则新建一个。"""
+        self._sessions = self._store.list_sessions()
+        if self._sessions:
+            s = self._sessions[0]
+            self.session = ChatSession(
+                session_id=s["id"], title=s["title"], summary=s["summary"])
+            self.session.load_messages_from(
+                self._store.load_messages(s["id"]))
+        else:
+            sid = self._store.create_session()
+            self.session = ChatSession(session_id=sid, title="新对话")
+
+    def refresh_sidebar(self) -> None:
+        """从库重载会话列表并刷新侧栏（保持当前会话高亮）。"""
+        self._sessions = self._store.list_sessions()
+        self.sess_list.clear()
+        for s in self._sessions:
+            item = QListWidgetItem(self._session_label(s))
+            item.setData(Qt.ItemDataRole.UserRole, s["id"])
+            item.setToolTip(s["title"] or "新对话")
+            self.sess_list.addItem(item)
+        if self.session.id is not None:
+            self._select_session_in_list(self.session.id)
+
+    def _select_session_in_list(self, sid: int) -> None:
+        for i in range(self.sess_list.count()):
+            it = self.sess_list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == sid:
+                self.sess_list.setCurrentItem(it)
+                return
+
+    def _session_label(self, s: dict) -> str:
+        title = s["title"] or "新对话"
+        rel = self._fmt_rel_time(s.get("updated_at") or "")
+        return f"{title}  ·  {rel}" if rel else title
+
+    def _fmt_rel_time(self, ts_text: str) -> str:
+        """把 'YYYY-MM-DD HH:MM:SS' 格式成中文相对时间。"""
+        try:
+            import datetime as _dt
+            dt = _dt.datetime.strptime(ts_text, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+        now = _dt.datetime.now()
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        if (now.date() - dt.date()).days == 1:
+            return self.tr("昨天", "yesterday")
+        if dt.year == now.year:
+            return dt.strftime("%m-%d")
+        return dt.strftime("%Y-%m-%d")
+
+    def _on_new_session(self) -> None:
+        if self._worker is not None:
+            self._flash_notice(
+                self.tr("正在生成，无法新建会话", "Still generating, try later"))
+            return
+        sid = self._store.create_session()
+        self.session = ChatSession(session_id=sid, title="新对话")
+        self._reset_session_view()
+        self.refresh_sidebar()
+
+    def _set_active_session(self, sid: int, force: bool = True) -> None:
+        """切换到指定会话（载入其历史与摘要）。
+
+        生成进行中禁止切换：_on_send 已把用户消息写进当前会话，_on_finished 会按
+        self.session.id 落库——切走会让回复写进错误会话。
+        """
+        if self._worker is not None:
+            self._flash_notice(
+                self.tr("正在生成，无法切换会话", "Still generating, try later"))
+            return
+        for s in self._sessions:
+            if s["id"] != sid:
+                continue
+            self.session = ChatSession(
+                session_id=sid, title=s["title"], summary=s["summary"])
+            self.session.load_messages_from(
+                self._store.load_messages(sid))
+            self._reset_session_view()
+            return
+
+    def _on_session_clicked(self, item: QListWidgetItem) -> None:
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        if sid != self.session.id:
+            self._set_active_session(sid)
+
+    def _reset_session_view(self, force: bool = True) -> None:
+        """切换/新建会话后：清空流式中间态并整段重渲染。"""
+        self._pending_assistant = []
+        self._pending_thinking = []
+        self._pending_tools = []
+        self._pending_blocks = []
+        self._cur_sub = None
+        self._cur_step = None
+        self._root = []
+        self._structured = False
+        self._notice_html = ""
+        self._reset_history_view(force=force)
+
+    def _on_session_menu(self, pos) -> None:
+        item = self.sess_list.itemAt(pos)
+        if item is None or self._worker is not None:
+            return
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        rename_act = menu.addAction(self.tr("重命名…", "Rename…"))
+        delete_act = menu.addAction(self.tr("删除会话", "Delete"))
+        act = menu.exec(self.sess_list.mapToGlobal(pos))
+        if act is rename_act:
+            self._rename_session(sid, item)
+        elif act is delete_act:
+            self._delete_session(sid)
+
+    def _rename_session(self, sid: int, item: QListWidgetItem) -> None:
+        old = item.text().split("  ·  ")[0]
+        text, ok = QInputDialog.getText(
+            self, self.tr("重命名", "Rename"),
+            self.tr("会话名称", "Session name"), text=old)
+        if ok and text.strip():
+            self._store.rename_session(sid, text.strip())
+            if sid == self.session.id:
+                self.session.title = text.strip()
+            self.refresh_sidebar()
+
+    def _delete_session(self, sid: int) -> None:
+        if QMessageBox.question(
+                self, self.tr("删除会话", "Delete session"),
+                self.tr("删除该会话及其全部消息？", "Delete this session and all its messages?"),
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._store.delete_session(sid)
+        self._sessions = self._store.list_sessions()
+        if not self._sessions:
+            ns = self._store.create_session()
+            self.session = ChatSession(session_id=ns, title="新对话")
+        else:
+            # 删除的是当前会话时跳回最近会话
+            if sid == self.session.id:
+                t = self._sessions[0]
+                self.session = ChatSession(
+                    session_id=t["id"], title=t["title"], summary=t["summary"])
+                self.session.load_messages_from(
+                    self._store.load_messages(t["id"]))
+        self.refresh_sidebar()
+        self._reset_session_view()
+
+    # ------------------------------------------------------------------ #
+    # 上下文构建（三合一）：自动裁剪 + 摘要注入 + 清空
+    # ------------------------------------------------------------------ #
+    def _build_context_messages(self) -> dict:
+        """计算发给模型的对话：摘要(若有) + 预算内最近尾部。
+
+        展示历史始终完整保留在 session.messages / DB；这里只决定「发给模型」
+        的部分——最旧的超出预算即被自动裁掉，保证上下文窗口不撑爆。
+        """
+        budget = max(int(self._context_tokens), 200)
+        summary = self.session.summary or ""
+        reserve = len(summary)
+        tail = []
+        used = 0
+        for m in reversed(self.session.messages):
+            t = self.session.estimate_tokens([m])
+            if tail and reserve + used + t > budget:
+                break
+            tail.append(m)
+            used += t
+        tail.reverse()
+        sent = []
+        if summary:
+            sent.append({"role": "system", "content": summary})
+        sent.extend(tail)
+        return sent
+
+    def _flash_notice(self, text: str) -> None:
+        pal = _chat_palette()
+        self._notice_html = (
+            f'<div style="margin:6px 0;color:{pal["meta"]};font-size:13px;">'
+            f'{_html.escape(text)}</div>')
+        self._reset_history_view(force=True)
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
@@ -620,13 +927,19 @@ class ChatPage(QWidget):
                       font_size: int = 13, msg_index: int | None = None,
                       show_time: bool = False, mtime: float | None = None,
                       thinking: str = "", images: list | None = None,
-                      tools: list | None = None) -> str:
+                      tools: list | None = None,
+                      agent_blocks: list | None = None) -> str:
         """把一条消息渲染为微信式气泡（圆形头像 + 带头尾气泡）。
 
         布局（flex）：assistant 头像在左、气泡在右；user 头像在右、气泡在左。
         两端不再用 <table align> 浮动。assistant 气泡下方带 token 统计与
         「原始/渲染」切换链接；show_time=True 时上方插入居中时间条。
         thinking 非空时（assistant），在气泡正文上方插入可折叠的思考块。
+
+        智能体模式（agent_blocks 非空）：正文渲染为「结构化步骤」视图——
+        每个子任务一块，其内部各 ReAct 步骤（模型正文 + 思考 + 工具活动）与
+        该步骤放在一起展示；多子任务时的 LLM 汇总作为最终回答置顶/置尾。
+        此时消息级的 thinking/tools 已被并入步骤块，不再单独渲染，避免重复。
         """
         pal = _chat_palette()
         text = str(text)
@@ -647,13 +960,17 @@ class ChatPage(QWidget):
         tools_html = ""
         if role == _ROLE_ASSISTANT:
             raw = msg_index is not None and self._render_raw.get(msg_index, False)
-            body = (_html.escape(text).replace("\n", "<br>") if raw
-                    else self._render_markdown(text, font_size))
-            # 思考块：可折叠（默认折叠），标题行可点击展开/关闭
-            if thinking:
+            if agent_blocks:
+                # 结构化步骤视图：正文即各子任务块 + 汇总；原文视图仍显示整段 markdown
+                body = (_html.escape(text).replace("\n", "<br>") if raw
+                        else self._agent_sections_html(agent_blocks, font_size))
+            else:
+                body = (_html.escape(text).replace("\n", "<br>") if raw
+                        else self._render_markdown(text, font_size))
+            # 思考块 / 工具活动：结构化视图下已并入各步骤块，不再顶层重复渲染
+            if thinking and not agent_blocks:
                 think_html = self._thinking_html(msg_index, thinking, font_size)
-            # 工具活动（智能体模式）：气泡内正文上方的状态行
-            if tools:
+            if tools and not agent_blocks:
                 tools_html = self._tools_html(tools, font_size)
             bits = []
             if meta:
@@ -805,6 +1122,104 @@ class ChatPage(QWidget):
         return ('<div style="margin:2px 0 6px;padding-left:8px;'
                 f'border-left:2px solid {pal["meta"]};">' + "".join(rows) + "</div>")
 
+    # 子代理类型的友好中文标签（回退原文）
+    _AGENT_TYPE_LABELS = {
+        "react": ("行动", "Act"),
+        "plan": ("规划", "Plan"),
+        "reflection": ("反思", "Reflect"),
+        "simple": ("简单", "Simple"),
+    }
+
+    def _agent_sections_html(self, blocks: list, font_size: int) -> str:
+        """把智能体的结构化产出渲染成「分块步骤」HTML（子任务 + 各步骤 + 汇总）。
+
+        blocks 为 gateway_llm.StreamingSuperAgent.blocks 的结构：
+        - subtask 块：标题（子任务 N · 类型）+ 内部 steps（每步 = 模型正文 + 思考 +
+          工具活动，与步骤放在一起）+ 可选 answer；
+        - summary 块：多子任务时 LLM 汇总的最终回答（按普通 markdown 渲染）。
+        这是「各步骤的回答和各步骤放在一起」的渲染落点。
+        """
+        pal = _chat_palette()
+        tr = self.tr
+        parts: list = []
+        for idx, b in enumerate(blocks):
+            kind = b.get("kind")
+            if kind == "summary":
+                text = (b.get("text") or "").strip()
+                if text:
+                    parts.append(self._render_markdown(text, font_size))
+                continue
+            # ---- 子任务块 ----
+            n = b.get("index", idx + 1)
+            atype = str(b.get("agent_type", "") or "")
+            label = self._AGENT_TYPE_LABELS.get(atype)
+            atype_txt = (tr(label[0], label[1]) if label else atype)
+            title = f"{tr('子任务', 'Subtask')} {n}"
+            if atype_txt:
+                title += f" · {_html.escape(atype_txt)}"
+            # 折叠标题行：默认展开（内联 on* 事件在本模块清洗后不会出现，这里只用
+            # href 链接固定为展开态，不依赖 JS 交互，保证从头到尾可见）。
+            header = (f'<div style="margin:10px 0 4px;padding:2px 8px;'
+                      f'font-weight:600;color:{pal["user_avatar"]};'
+                      f'font-size:{font_size}px;border-left:3px solid '
+                      f'{pal["user_avatar"]};">'
+                      f'⚙ {_html.escape(title)}</div>')
+            parts.append(header)
+
+            steps = b.get("steps") or []
+            step_htmls: list = []
+            step_text_all: list = []
+            for st in steps:
+                st_h = self._agent_step_html(st, font_size)
+                if not st_h:
+                    continue
+                step_htmls.append(st_h)
+                step_text_all.append(st.get("text", ""))
+            # 各步骤：模型正文 + 思考 + 工具活动，与步骤号放在一起
+            if step_htmls:
+                parts.append(
+                    '<div style="padding-left:6px;border-left:2px solid '
+                    f'{pal["meta"]};">' + "".join(step_htmls) + "</div>")
+
+            # 子任务的最终答案：与已逐 token 流过 / 收尾补充的结果一致；若已被某步
+            # 正文整段覆盖（常见于「无工具」的单步反应），则不重复展示。
+            answer = (b.get("answer") or "").strip()
+            if answer and answer not in "".join(step_text_all):
+                parts.append(
+                    '<div style="margin:8px 0 2px;font-weight:600;'
+                    f'color:{pal["assistant_text"]};font-size:{font_size}px;">'
+                    + _html.escape(tr("✅ 结论", "✅ Conclusion")) + "</div>")
+                parts.append(self._render_markdown(answer, font_size))
+        return "".join(parts)
+
+    def _agent_step_html(self, st: dict, font_size: int) -> str:
+        """把子任务内的单个 ReAct 步骤渲染为「步骤号 + 模型正文 + 思考 + 工具」小单元。"""
+        pal = _chat_palette()
+        n = st.get("n")
+        text = (st.get("text") or "").strip()
+        thinking = (st.get("thinking") or "").strip()
+        tools = st.get("tools") or []
+        if not (text or thinking or tools):
+            return ""
+        bits: list = []
+        label = (self.tr(f"第 {n} 步", f"Step {n}") if n
+                 else "")
+        if label:
+            bits.append(
+                f'<div style="font-size:{font_size - 1}px;font-weight:600;'
+                f'color:{pal["meta"]};margin:6px 0 2px;">'
+                f'{_html.escape(label)}</div>')
+        if thinking:
+            bits.append(
+                f'<div style="color:{pal["meta"]};font-size:{font_size - 1}px;'
+                f'margin:2px 0;padding-left:8px;border-left:2px solid '
+                f'{pal["meta"]};">{self._render_markdown(thinking, font_size - 1)}</div>')
+        if text:
+            bits.append(self._render_markdown(text, font_size))
+        if tools:
+            bits.append(self._tools_html(tools, font_size))
+        return "".join(bits)
+
     @Slot(QUrl)
     def _on_anchor_clicked(self, url):
         """处理气泡内切换链接点击，翻转对应消息的显示格式并重放。"""
@@ -855,6 +1270,25 @@ class ChatPage(QWidget):
                 "The agent requests to run a command over SSH:\n\n"
                 "Host: {host}\nCommand: {command}\n\nAllow it?").format(
                 host=proposal.get("host", ""), command=proposal.get("command", ""))
+            yes = MessageBox.question(self, title, text) == QMessageBox.Yes
+            self._approval.resolve(proposal, yes)
+            return
+
+        # 浏览器动作：proposal 携带 {action:"browser", browser_action, params}。会改页面
+        # 状态的动作（goto/click/fill 等）需人工确认，明示动作与关键参数。
+        if proposal.get("action") == "browser":
+            browser_action = proposal.get("browser_action", "")
+            params = proposal.get("params") or {}
+            detail = _html.escape(_short_repr(params))
+            title = self.tr("允许浏览器执行动作？", "Allow browser action?")
+            text = self.tr(
+                "智能体请求在浏览器中执行动作：\n\n"
+                "动作：{action}\n"
+                "参数：{params}\n\n"
+                "是否允许？",
+                "The agent requests a browser action:\n\n"
+                "Action: {action}\nParams: {params}\n\nAllow it?").format(
+                action=browser_action, params=detail)
             yes = MessageBox.question(self, title, text) == QMessageBox.Yes
             self._approval.resolve(proposal, yes)
             return
@@ -939,7 +1373,8 @@ class ChatPage(QWidget):
                 parts.append(self._render_block(
                     role, text, meta, self._font_size, i,
                     show_time=show_time, mtime=ts, thinking=thinking,
-                    images=images, tools=m.get("_tools")))
+                    images=images, tools=m.get("_tools"),
+                    agent_blocks=m.get("_agent_blocks")))
         if self._pending_assistant:
             # 流式中：整条视为「新的一段时间」，仅在最新一条之后显示时间
             now = _time.time()
@@ -968,11 +1403,22 @@ class ChatPage(QWidget):
         text = "".join(self._pending_assistant)
         thinking = "".join(self._pending_thinking)
         tools = list(self._pending_tools) or None
+        now = mtime if mtime is not None else _time.time()
+        show_time = show_time or not (len(self.session.messages) > 0)
+        # 智能体模式结构化流式：步骤按子任务/步骤分组随流渲染（每 token 都刷新），
+        # 不混入正文；正文仍由 _pending_assistant 保留为原文（原文/渲染切换用）。
+        if self._structured:
+            blocks = self._agent_live_blocks()
+            if not blocks:
+                return ""
+            return self._render_block(
+                _ROLE_ASSISTANT, text,
+                font_size=self._font_size, show_time=show_time, mtime=now,
+                thinking=thinking, tools=tools,
+                agent_blocks=blocks)
         # 正文为空但有思考/工具活动时也要渲染（智能体工具循环阶段能看到状态行）
         if not (text or thinking or tools):
             return ""
-        now = mtime if mtime is not None else _time.time()
-        show_time = show_time or not (len(self.session.messages) > 0)
         return self._render_block(
             _ROLE_ASSISTANT, text,
             font_size=self._font_size, show_time=show_time, mtime=now,
@@ -1164,6 +1610,11 @@ class ChatPage(QWidget):
             return
         pid = self._provider_id()
         self.session.add_user(text, images=images if images else None)
+        # 用户消息写透（seq 对其 DB 列；meta 暂无）
+        if self.session.id is not None:
+            self._store.add_message(
+                self.session.id, self.session._seq, "user",
+                self.session.messages[-1]["content"], {})
         self.input.clear()
 
         # 渲染：重建整段（含新增用户气泡），立即生效。用户主动发送：强制贴底
@@ -1176,14 +1627,34 @@ class ChatPage(QWidget):
         self._reset_history_view(force=True, force_pin=True)
 
         self._set_busy(True)
+        # 走上下文构建：摘要(若有) + 预算内最近尾部（自动裁剪最旧），而非全量历史
         self._worker = _ChatWorker(
-            self.gateway, self.session.to_message_list(),
+            self.gateway, self._build_context_messages(),
             provider_id=pid, thinking_enabled=self._thinking_on,
-            agent_mode=self._agent_on, approval=self._approval)
+            agent_mode=self._agent_on, approval=self._approval,
+            agent_session=self._ensure_agent_session())
         self._worker.token.connect(self._on_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
+
+    def _ensure_agent_session(self):
+        """返回智能体模式的跨轮复用会话（Fix 3）。
+
+        会话 id 变化（新建/切换/删除）时重建，使新对话从干净记忆开始；同一对话内
+        （agent 模式）沿多轮共享同一实例，令工具激活状态与跨轮历史得以保持。
+        """
+        if not self._agent_on:
+            return None
+        sid = self.session.id
+        if (self._agent_session is None
+                or self._agent_session_sid != sid):
+            from ..agent_bridge import AgentChatSession
+            self._agent_session = AgentChatSession(
+                self.gateway, provider_id=self._provider_id(),
+                approval=self._approval)
+            self._agent_session_sid = sid
+        return self._agent_session
 
     @Slot()
     def _on_add_image(self):
@@ -1222,35 +1693,79 @@ class ChatPage(QWidget):
 
     @Slot(str)
     def _on_token(self, piece: str):
-        # 思考增量被 THINK_TAG 包裹，与正文分离，避免混入回复文本；
-        # 工具活动被 TOOL_TAG 包裹（智能体模式），解析成状态行事件。
-        # 两者都走同一 token 通道，逐段剥离（tag 可能跨 piece 到达）。
-        piece = self._strip_tool_tags(piece)
-        while THINK_TAG in piece:
-            before, _, rest = piece.partition(THINK_TAG)
-            if before:
-                self._pending_assistant.append(before)
-            think, _, after = rest.partition(THINK_END_TAG)
-            if think:
-                self._pending_thinking.append(think)
-            piece = after
-        if piece:
-            self._pending_assistant.append(piece)
+        # 统一消费一段增量：拆分带外 token（think/tool/sub/step/sans），普通文本
+        # 归入当前步骤 / 子任务 / 根汇总。思考、工具、结构化边界都在这一层被剥离，
+        # 不混入助手正文（正文只保留各步骤/汇总的模型文本）。
+        self._consume_agent_piece(piece)
         # 增量流式：只重建并刷入最后一条进行中气泡（历史已渲染，不再每次全量重排）。
         # 结束时（on_finished）再走整段 _reset_history_view 固化全部。
         self._refresh_streaming()
 
-    def _strip_tool_tags(self, piece: str) -> str:
-        """剥离 TOOL_TAG 包裹的工具事件段，累积到 _pending_tools。
+    def _consume_agent_piece(self, piece: str) -> None:
+        """把一段流式增量切成 token 与文本，分发给结构化步骤状态或既有累积器。
 
-        事件为完整 JSON（yield 时整段给出，不跨 piece），解析失败整段丢弃——
-        控制字符不会由模型文本伪造（见 agent_bridge 的 yield 侧包装）。
+        所有带外 token 都是 yield 侧整段给出的（不跨 piece），故按 piece 切分安全。
+        文本块一律进 _pending_assistant（作为消息原文 / 原文切换视图），同时按当前
+        开启的步骤 → 子任务 → 根汇总归属到结构化状态。
         """
-        while TOOL_TAG in piece:
-            before, _, rest = piece.partition(TOOL_TAG)
-            if before:
-                self._pending_assistant.append(before)
-            evt, _, after = rest.partition(TOOL_END_TAG)
+        for seg in _AGENT_TOKEN_RE.split(piece):
+            if not seg:
+                continue
+            if seg[0] == "\x01":
+                self._apply_structure_token(seg)
+            else:
+                self._route_text(seg)
+
+    def _route_text(self, seg: str) -> None:
+        """一段普通模型文本：进原文累积，并按当前结构归属。"""
+        self._pending_assistant.append(seg)
+        if self._cur_step is not None:
+            self._cur_step["text"].append(seg)
+        elif self._cur_sub is not None:
+            self._cur_sub["text"].append(seg)
+        else:
+            self._root.append(seg)
+
+    def _apply_structure_token(self, seg: str) -> None:
+        """处理一个带外结构 token（sub/step/sans /sub、think、tool）。"""
+        if seg.startswith(SUB_OPEN):
+            data = self._token_json(seg[len(SUB_OPEN):-1])
+            # 新子任务：把上一个子任务收尾落入已完成块，开启当前块
+            self._flush_current_sub()
+            self._structured = True
+            self._cur_sub = {
+                "kind": "subtask",
+                "index": int((data or {}).get("index", 0) or 0),
+                "agent_type": str((data or {}).get("agent_type", "") or ""),
+                "steps": [], "answer": "", "text": [], "tools": [],
+            }
+        elif seg.startswith(STEP_OPEN):
+            data = self._token_json(seg[len(STEP_OPEN):-1])
+            # 新一步：把上一步收尾，开启当前步（其正文/思考/工具都归这一步）
+            self._flush_current_step()
+            self._cur_step = {
+                "n": int((data or {}).get("n", 0) or 0),
+                "text": [], "thinking": [], "tools": [],
+            }
+        elif seg.startswith(SUB_ANSWER):
+            data = self._token_json(seg[len(SUB_ANSWER):-1])
+            if self._cur_sub is not None:
+                self._cur_sub["answer"] = str((data or {}).get("answer", "") or "")
+        elif seg.startswith(SUB_END):
+            self._flush_current_sub()
+        elif seg.startswith(THINK_TAG):
+            inner = seg[len(THINK_TAG):]
+            think = inner[:-len(THINK_END_TAG)] if inner.endswith(THINK_END_TAG) else inner
+            if think:
+                if self._cur_step is not None:
+                    self._cur_step["thinking"].append(think)
+                elif self._cur_sub is not None:
+                    self._cur_sub["text"].append(think)
+                else:
+                    self._pending_thinking.append(think)
+        elif seg.startswith(TOOL_TAG):
+            inner = seg[len(TOOL_TAG):]
+            evt = inner[:-len(TOOL_END_TAG)] if inner.endswith(TOOL_END_TAG) else inner
             try:
                 data = _json.loads(evt)
                 # call 事件第四位存参数摘要；result 事件存返回文本（含产出路径，
@@ -1259,23 +1774,122 @@ class ChatPage(QWidget):
                     detail = str(data.get("args", "") or "")
                 else:
                     detail = str(data.get("text", "") or "")
-                self._pending_tools.append((
-                    str(data.get("name", "?")), str(data.get("kind", "")),
-                    bool(data.get("ok", True)), detail))
+                tup = (str(data.get("name", "?")), str(data.get("kind", "")),
+                       bool(data.get("ok", True)), detail)
+                # 顶层也记录（作为非结构化回退 / 消息级 _tools 备份）
+                self._pending_tools.append(tup)
+                if self._cur_step is not None:
+                    self._cur_step["tools"].append(tup)
+                elif self._cur_sub is not None:
+                    self._cur_sub["text"].append("")  # 占位避免空；下面存 tools
+                    self._cur_sub["tools"].append(tup)
             except Exception:
                 pass
-            piece = after
-        return piece
+
+    @staticmethod
+    def _token_json(payload: str):
+        """解析 token 负载 JSON；解析失败返回 None（整段丢弃）。"""
+        try:
+            return _json.loads(payload)
+        except Exception:
+            return None
+
+    def _flush_current_step(self) -> None:
+        """收尾当前步骤（有内容且处于某子任务内则落入该子任务的 steps）。"""
+        if self._cur_step is not None and self._cur_sub is not None:
+            st = self._cur_step
+            if st["text"] or st["thinking"] or st["tools"]:
+                self._cur_sub["steps"].append({
+                    "n": st["n"],
+                    "text": "".join(st["text"]),
+                    "thinking": "".join(st["thinking"]).strip(),
+                    "tools": list(st["tools"]),
+                })
+        self._cur_step = None
+
+    def _flush_current_sub(self) -> None:
+        """收尾当前子任务：把步骤与新出现的前导文本落入块并加入已完成列表。"""
+        sub = self._cur_sub
+        if sub is None:
+            self._cur_step = None
+            return
+        self._flush_current_step()
+        # 子任务正文若早于首个步骤出现（罕见），折叠成一步
+        if not sub["steps"]:
+            lead = "".join(sub["text"]).strip()
+            tools = sub.get("tools") or []
+            if lead or tools:
+                sub["steps"] = [{"n": 0, "text": lead,
+                                 "thinking": "", "tools": list(tools)}]
+        sub.pop("text", None)
+        sub.pop("tools", None)
+        self._pending_blocks.append(sub)
+        self._cur_sub = None
+        self._cur_step = None
+
+    def _agent_live_blocks(self) -> list:
+        """返回当前用于流式渲染的可见块（含正在进行的子任务 / 根汇总，不破坏状态）。"""
+        blocks = list(self._pending_blocks)
+        if self._cur_sub is not None:
+            steps = list(self._cur_sub["steps"])
+            if self._cur_step is not None and (
+                    self._cur_step["text"] or self._cur_step["thinking"]
+                    or self._cur_step["tools"]):
+                steps = steps + [{
+                    "n": self._cur_step["n"],
+                    "text": "".join(self._cur_step["text"]),
+                    "thinking": "".join(self._cur_step["thinking"]).strip(),
+                    "tools": list(self._cur_step["tools"]),
+                }]
+            # 尚未出现任何步骤时（如 simple 智能体无 STEP 事件直接流文本），把
+            # 子任务级待定正文/工具折叠成第 0 步，直播期间也能看到内容。
+            if not steps:
+                lead = "".join(self._cur_sub["text"]).strip()
+                sub_tools = [t for t in self._cur_sub.get("tools", [])
+                             if t not in (self._cur_step or {}).get("tools", [])]
+                if lead or sub_tools:
+                    steps = [{"n": 0, "text": lead, "thinking": "",
+                              "tools": list(sub_tools)}]
+            live = dict(self._cur_sub)
+            live["steps"] = steps
+            live.pop("text", None)
+            live.pop("tools", None)
+            blocks.append(live)
+        root = "".join(self._root).strip()
+        if root:
+            blocks.append({"kind": "summary", "text": root})
+        return blocks
+
+    def _finalize_agent_blocks(self) -> list:
+        """流式结束：收尾当前子任务，返回完整块列表（含根汇总）并清空状态。"""
+        self._flush_current_sub()
+        blocks = list(self._pending_blocks)
+        root = "".join(self._root).strip()
+        if root:
+            blocks.append({"kind": "summary", "text": root})
+        return blocks
 
     @Slot(object)
     def _on_finished(self, result):
         full = "".join(self._pending_assistant)
         if result is not None:
-            self._last_stats = self.tr(
-                f"{result.total_tokens:,} tokens · "
-                f"{result.elapsed_ms / 1000:.1f}s",
-                f"{result.total_tokens:,} tokens · "
-                f"{result.elapsed_ms / 1000:.1f}s")
+            # 智能体模式（多次底层调用）展示调用次数与提示/输出拆分，使总 token
+            # 数值可解释、可在「调用记录」页逐笔核对；普通模式维持单一总数。
+            if getattr(result, "calls", 0) > 1 or self._structured:
+                en = (f"{result.calls} calls · "
+                      f"prompt {result.prompt_tokens:,} + output "
+                      f"{result.completion_tokens:,} · "
+                      f"{result.elapsed_ms / 1000:.1f}s")
+                zh = (f"{result.calls} 次调用 · "
+                      f"提示 {result.prompt_tokens:,} + 输出 "
+                      f"{result.completion_tokens:,} · "
+                      f"{result.elapsed_ms / 1000:.1f}s")
+            else:
+                en = (f"{result.total_tokens:,} tokens · "
+                      f"{result.elapsed_ms / 1000:.1f}s")
+                zh = (f"{result.total_tokens:,} tokens · "
+                      f"{result.elapsed_ms / 1000:.1f}s")
+            self._last_stats = self.tr(zh, en)
         if full:
             # 将统计与思考内容内嵌到消息，供 _reset_history_view 重放时显示
             self.session.add_assistant(full)
@@ -1288,6 +1902,27 @@ class ChatPage(QWidget):
         # 智能体模式：把本轮工具活动存进这条助手消息，重放时仍可展示
         if self._pending_tools:
             self.session.messages[-1]["_tools"] = list(self._pending_tools)
+        # 智能体模式：结构化步骤（子任务 → 各步骤 → 文本/工具）持久化到消息，供
+        # _reset_history_view 分块渲染；有结构时正文以步骤视图展示，消息级
+        # thinking/tools 已并入步骤块、不再重复渲染。优先用流式期间就地构建的块
+        #（与直播渲染分块一致），无流式结构时回退到 result.agent_blocks。
+        blocks = self._finalize_agent_blocks() if self._structured else []
+        if result is not None and getattr(result, "agent_blocks", None):
+            blocks = blocks or list(result.agent_blocks)
+        if blocks:
+            self.session.messages[-1]["_agent_blocks"] = list(blocks)
+        # 助手消息写透（含统计/思考/工具/结构化块 meta）；更新会话活跃时间与侧栏排序
+        if self.session.id is not None:
+            last = self.session.messages[-1]
+            meta = {
+                k: last[k] for k in ("_meta", "_thinking", "_tools", "_agent_blocks")
+                if k in last
+            }
+            self._store.add_message(
+                self.session.id, self.session._seq, "assistant",
+                last["content"], meta)
+            self._store.touch(self.session.id)
+            self.refresh_sidebar()
         self._cleanup_worker()
         self._reset_history_view()
         self._scroll_to_bottom()
@@ -1307,6 +1942,12 @@ class ChatPage(QWidget):
         self._pending_assistant = []
         self._pending_thinking = []
         self._pending_tools = []
+        # 重置智能体流式结构状态（下轮从干净状态开始）
+        self._pending_blocks = []
+        self._cur_sub = None
+        self._cur_step = None
+        self._root = []
+        self._structured = False
         self._set_busy(False)
         # 流式结束/停止：移除页面里的增量流式节点与光标，避免残留。
         self._pending_stream_html = None
@@ -1376,6 +2017,13 @@ class ChatPage(QWidget):
             self._worker.stop()
             self._cleanup_worker()
         self.session.clear()
+        # 清空上下文：同时丢弃智能体的跨轮记忆（Fix 3），下次发送从干净状态开始
+        self._agent_session = None
+        self._agent_session_sid = None
+        # 同步清掉库里该会话的消息与摘要（展示与库保持一致）
+        if self.session.id is not None:
+            self._store.delete_range(self.session.id, 0)
+            self._store.set_summary(self.session.id, "")
         self._pending_assistant = []
         self._pending_thinking = []
         self._pending_tools = []

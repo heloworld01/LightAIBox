@@ -93,3 +93,8 @@ DEFAULT_SERVER_PORT = 8765
 # 统一 API 服务监听地址/端口的 QSettings 持久化键（自动启动时据此绑定）
 SETTINGS_SERVER_HOST = "api/host"
 SETTINGS_SERVER_PORT = "api/port"
+
+# 对话上下文预算：发给模型的对话（默认单位的 token 后端底估值）超过此值，自动从最旧
+# 消息裁掉只保留最近一段。展示历史不受影响；配合「LLM 摘要压缩」可把旧文压成摘要收回
+# 预算。QSettings 键 chat/context_tokens 可覆盖。
+CHAT_CONTEXT_TOKENS = 6000
