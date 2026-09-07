@@ -169,6 +169,11 @@ Key properties:
 - **Transparent UI** — each step streams in-band: tool calls and results appear as
   `🔧 ✓ calculator 2+3*4 = 14` status lines in the bubble, thinking segments in the
   collapsible block (if thinking mode is on), and the final answer as normal markdown.
+- **Structured subtask rendering** — the agent's output is rendered as grouped steps:
+  a single task shows its actions / conclusion directly (no redundant numbering), while a
+  compound request that combines analysis/planning with producing/writing (e.g. "compare X
+  and Y, then write a report") is automatically split into multiple subtasks — each shown
+  under a `⚙ Subtask N · <type>` header — and finished with an LLM-generated summary.
 
 Under the hood the orchestration is provided by the external LightAgents framework
 (`../LightAgents`, SuperAgent + sub-agents + tool discovery via ToolCatalog / FindTools),
