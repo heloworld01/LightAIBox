@@ -12,7 +12,7 @@ A PySide6 desktop gateway that unifies multiple LLM API providers (OpenAI-compat
 
 - **Unified API proxy** — a single `chat` / `chat_stream` interface hides the OpenAI / Anthropic protocol differences. Call a specific model, or leave it unset to auto-select a provider by policy.
 - **Claude Code ready** — the Anthropic-compatible endpoint fully passes through `tools` and multi-turn `tool_result`, with spec-compliant streaming `tool_use` events, so it can drive Claude Code's multi-step agent loop directly.
-- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, collapsible **thinking** display, **image uploads for multimodal chats**, an optional **agent mode** that runs a LightAgents SuperAgent orchestration loop (intent routing + tool discovery + streaming) with built-in desktop tools and **sandboxed file generation** (docx / xlsx), and time separators (see [Built-in Chat](#built-in-chat)).
+- **Built-in AI chat** — a WeChat-style chat tab right in the app: streaming replies, Markdown + offline MathJax-rendered LaTeX and mermaid diagrams, a per-reply **Raw / Render** toggle, collapsible **thinking** display, **image uploads for multimodal chats**, an optional **agent mode** that runs a LightAgents SuperAgent orchestration loop (intent routing + tool discovery + streaming) with built-in desktop tools, **sandboxed file generation** (docx / xlsx), **browser automation** (open pages / click / screenshot) and **gated SSH remote execution**, and time separators (see [Built-in Chat](#built-in-chat)).
 - **Multiple providers** — add / edit / copy / delete providers (name, protocol, base URL, API key, model, multimodal flag), plus **JSON import / export** of the whole provider list for backup or sharing, with background connectivity testing that never blocks the UI.
 - **Smart scheduling** — pick among available providers by policy (long-input-first / short-input-first), with automatic fallback on failure. Image requests route only to providers flagged as multimodal (a clear error instead of silently dropping images); mislabeled providers get the flag auto-revoked after repeated image failures.
 - **Quota control** — limit by call count or token count; auto-disables a provider when it exceeds quota, resettable in one click.
@@ -146,6 +146,24 @@ Key properties:
   dialog** showing the path, type and size before anything hits disk
   (`app/approval.py` + `app/file_tools.py`). Produced files are surfaced as a `🔗 打开`
   link you can click to open in the system default app.
+- **Weather / location** — `weather` (online) returns multi-day forecasts for a city (or you
+  can just name a place and it resolves the city), and `get_current_location` reports your
+  IP-derived location. Both are **on-demand**: they're not always in the model's tool schema,
+  but are discovered via FindTools when you ask about the weather or where you are.
+- **Browser automation (Playwright)** — the `browser` tool can genuinely **open a web page**,
+  extract visible text, click / fill / scroll / press keys, run JS and take screenshots,
+  driving your local Google Chrome. When the page needs login / a CAPTCHA, it tells you to
+  finish it manually in the Chrome window and then keeps going. It's discovered on demand
+  (ask to "open the browser / visit a web page / search on a site"); **state-changing
+  actions** (`goto` / `click` / `fill` …) are gated behind a confirmation dialog showing the
+  action and its parameters, while read-only grabs (text / screenshot) run freely. *Note: it
+  opens Chrome headless by default (invisible) for extracting content; a visible window is
+  intended for demo / screen-capture use.*
+- **SSH remote commands (Python)** — with an approved remote host, the `ssh_exec` tool runs
+  commands on a server over SSH. **Every execution pops a
+  confirmation dialog showing the host and the command** before it runs; credentials come from
+  the configured session, never from the model. Discovered on demand (ask to "run a command /
+  connect to the server / deploy").
 - **Fail-safe observations** — a tool error becomes an observation (`❌ …`) fed back to
   the model instead of aborting the loop; it can retry or explain.
 - **Transparent UI** — each step streams in-band: tool calls and results appear as
@@ -155,7 +173,9 @@ Key properties:
 Under the hood the orchestration is provided by the external LightAgents framework
 (`../LightAgents`, SuperAgent + sub-agents + tool discovery via ToolCatalog / FindTools),
 streamed through `app/agent_bridge.py`; the desktop tool registry lives in
-`app/gateway_llm.py` + `app/agent_tools.py`.
+`app/gateway_llm.py` + `app/agent_tools.py`, with the browser / SSH / weather tools coming
+from LightAgents' built-in `browser_tool` / `ssh_exec_tool` / `weather_tool` (Playwright and
+paramiko are optional deps — skipped if missing).
 
 ## Project Structure
 

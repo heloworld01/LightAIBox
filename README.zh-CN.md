@@ -12,7 +12,7 @@
 
 - **统一 API 代理**：`chat` / `chat_stream` 一个接口屏蔽 OpenAI 与 Anthropic 协议差异，支持指定模型与按策略自适应、一次性与流式输出。
 - **Claude Code 直连**：Anthropic 兼容端点完整透传 `tools` 与多轮 `tool_result`，流式 tool_use 遵循官方协议，可直接承载多步 agent 循环。
-- **内置对话**：应用内即含微信式**对话**页，流式回复、Markdown + 离线 MathJax 渲染 LaTeX 公式与 mermaid 图表、每条回复可「原文 / 渲染」切换、思考模式折叠展示、可发送图片做多模态对话、可开启**智能体模式**走 LightAgents SuperAgent 编排（意图路由 + 工具发现 + 流式汇总）并配内置桌面工具与**沙箱文件产出（docx / xlsx）**、带时间分隔条（详见[内置对话](#内置对话)）。
+- **内置对话**：应用内即含微信式**对话**页，流式回复、Markdown + 离线 MathJax 渲染 LaTeX 公式与 mermaid 图表、每条回复可「原文 / 渲染」切换、思考模式折叠展示、可发送图片做多模态对话、可开启**智能体模式**走 LightAgents SuperAgent 编排（意图路由 + 工具发现 + 流式汇总）并配内置桌面工具、**沙箱文件产出（docx / xlsx）**、**浏览器自动化（开网页 / 点击 / 截图）**与**受闸门控制的 SSH 远程执行**、带时间分隔条（详见[内置对话](#内置对话)）。
 - **多 Provider 管理**：可视化增删改查，支持**JSON 导入 / 导出**整份 Provider 配置（备份 / 迁移 / 分享），后台测连不卡界面、无弹窗；每个 Provider 可标记「支持多模态（图片）」，列表以 🖼 标识。
 - **智能调度**：按策略（长输入优先 / 短输入优先）挑选，单 Provider 失败自动降级重试；含图片的请求只路由到标记为多模态的 Provider（无匹配则明确报错，不静默丢图），误标多模态的 Provider 发图连续失败后自动撤销标记。
 - **配额控制**：按调用次数或 token 数设限，超配额自动停用、可一键重置。
@@ -123,6 +123,18 @@ claude
   `OUTPUT_ROOT`），上限 20 MB；**每次写入前都弹窗确认**（路径 / 类型 / 大小），确认后
   才落盘（`app/approval.py` + `app/file_tools.py`）。产出的文件以 `🔗 打开` 链接呈现，
   点击即在系统默认应用中打开。
+- **天气 / 定位**：`weather`（联网）返回某城市多日天气预报（也可只报地名、自动解析出城市），
+  `get_current_location` 按 IP 给出当前位置。两者均**按需发现**——不常驻模型工具表，问天气 /
+  问我在哪时经 FindTools 检索后注入。
+- **浏览器自动化（Playwright）**：`browser` 工具能真实**打开网页**、抓取可见文本、点击 /
+  填表 / 滚动 / 按键、执行 JS 与截图，联动本机 Google Chrome。页面需要登录 / 验证码时会提示
+  在 Chrome 窗口手动完成后再继续。同样**按需发现**（说要「打开浏览器 / 访问网址 / 上某网站
+  查询」时命中）；**改变页面状态的动作**（`goto` / `click` / `fill` 等）经确认弹窗（明示动作
+  与参数）闸门，而只读抓取（text / 截图）自由放行。*注：默认无头（不可见）打开 Chrome 用于抓
+  取内容；可见窗口面向「要给用户亲眼看界面」的演示 / 截图场景。*
+- **SSH 远程执行（Python）**：经审批配置了远端主机后，`ssh_exec` 可在服务器上经 SSH 执行命令；
+  **每次执行前都弹窗确认「主机 + 命令」**才运行，凭据来自已配置会话、模型不可见。按需发现
+  （说「执行命令 / 连服务器 / 部署」时命中）。
 - **失败不中断**：工具报错转为观察结果（`❌ …`）回喂模型，可重试或如实说明，而非直接
   终止循环。
 - **透明 UI**：每一步都随流式呈现——工具调用与结果以 `🔧 ✓ calculator 2+3*4 = 14`
@@ -131,7 +143,9 @@ claude
 
 底层编排来自外部 LightAgents 框架（`../LightAgents`，SuperAgent + 子代理 +
 ToolCatalog / FindTools 工具发现），经 `app/agent_bridge.py` 流式接入；桌面工具注册表在
-`app/gateway_llm.py` + `app/agent_tools.py`。
+`app/gateway_llm.py` + `app/agent_tools.py`，其中浏览器 / SSH / 天气工具来自 LightAgents
+内置的 `browser_tool` / `ssh_exec_tool` / `weather_tool`（Playwright 与 paramiko 为可选
+依赖，缺失时自动跳过不注册）。
 
 ## 目录结构
 
