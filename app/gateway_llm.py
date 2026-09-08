@@ -33,11 +33,14 @@ tool_use / tool_result 内容块）。翻译逻辑与 LightAgents 的 ``Anthropi
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from . import config
 from .gateway import Gateway
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +89,23 @@ def _skills_dir() -> Optional[str]:
         if os.path.isdir(cand):
             return cand
     return None
+
+
+_redact_args_cached = None
+
+
+def _redact_args(args: Any) -> Any:
+    """懒加载 light_agents.tools.redact.redact_dict，对工具参数做凭据脱敏。
+
+    SSH 等工具允许模型从提问中提供 password，此函数确保 password 等敏感字段在
+    进入 UI 事件 / 步骤块 / 日志前被掩码（***），不落明文。
+    """
+    global _redact_args_cached
+    if _redact_args_cached is None:
+        _ensure_lightagents()
+        from light_agents.tools.redact import redact_dict  # noqa: PLC0415
+        _redact_args_cached = redact_dict
+    return _redact_args_cached(args)
 
 
 def _LightAgentsLLM_types():
@@ -788,7 +808,7 @@ class StreamingSuperAgent:
                 tid = d.get("tool_call_id", "")
                 if tid:
                     pending_calls[tid] = (d.get("tool_name", "?"),
-                                          d.get("args", {}) or {})
+                                          _redact_args(d.get("args", {}) or {}))
 
             def _add_tool(name, kind, ok, detail):
                 """把一条工具活动记入当前步骤（与 ChatPage._pending_tools 同口径）。"""
@@ -836,7 +856,7 @@ class StreamingSuperAgent:
                     elif et == StreamEventType.TOOL_CALL_START:
                         _add_tool(str(evt.data.get("tool_name", "?")),
                                   "call", True,
-                                  str(evt.data.get("args", {}) or {}))
+                                  str(_redact_args(evt.data.get("args", {}) or {})))
                     elif et == StreamEventType.TOOL_CALL_FINISH:
                         rtext = str(evt.data.get("result", "") or "")
                         _add_tool(str(evt.data.get("tool_name", "?")),
@@ -922,7 +942,7 @@ class StreamingSuperAgent:
         if t == StreamEventType.TOOL_CALL_START:
             return [_tool_event("call", name=data.get("tool_name", "?"),
                                 id=data.get("tool_call_id", ""),
-                                args=data.get("args", {}))]
+                                args=_redact_args(data.get("args", {})))]
         if t == StreamEventType.ERROR:
             return [f"\n（错误：{data.get('error', '') or data.get('message', '')}）\n"]
         # STEP_* / AGENT_* 不吐正文
@@ -1120,20 +1140,39 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
             registry.register_tool(DesktopToolAdapter(file_tools, tool["name"]))
 
     # SSH 远程命令执行（paramiko）：SSH = 远端代码执行，只有提供了 approval 确认
-    # 闸门才注册（与 file_tools 同条件）。每次执行前经 approval.await_approval 弹窗
-    # 让人工确认「主机 + 命令」；认证凭据全部来自构造参数（模型不可见）。
+    # 闸门才注册（与 file_tools 同条件）。每次执行前经 approval.await_approval 以
+    # 气泡内确认条让人工确认「主机 + 命令」（非弹窗）。模型可从提问中提供
+    # user/password/port（密码在宿主边界脱敏，见 _redact_args）；私钥与默认凭据在
+    # 工具构造期注入（模型不可见）。
+    #
+    # fail-fast（P0）：注册前先探测 paramiko，缺失则**不注册、不加入目录**，避免
+    # 模型反复撞「未安装 paramiko」错误；同时给出可行动的宿主侧提示。
     ssh_tool = None
     if approval is not None:
         try:
-            from light_agents.tools.builtin.ssh_exec_tool import SSHExecTool  # noqa: PLC0415
-            ssh_tool = SSHExecTool(
-                approval=lambda host, cmd: approval.await_approval(
-                    {"action": "ssh", "host": host, "command": cmd}),
-            )
-            if registry.get_tool("ssh_exec") is None:
-                registry.register_tool(ssh_tool)
-        except Exception:  # noqa: BLE001 —— paramiko 缺失/框架不兼容则跳过注册
-            ssh_tool = None
+            import paramiko  # noqa: F401 —— 注册期能力探测
+        except ImportError:
+            logger.warning(
+                "paramiko 未安装，SSH 工具未注册。请先 pip install paramiko 后重启 "
+                "再使用「SSH 远程执行」能力。")
+        else:
+            try:
+                from light_agents.tools.builtin.ssh_exec_tool import SSHExecTool  # noqa: PLC0415
+                ssh_tool = SSHExecTool(
+                    # auto_add_host_keys=True：首次连接自动信任主机密钥（AutoAddPolicy），
+                    # 避免默认 RejectPolicy 因主机未出现在系统 known_hosts 而反复报
+                    # 「Server ... not found in known_hosts」。安全取舍：首次连接不校验
+                    # 指纹（对内网可信机可接受）；每次执行前仍经下方 approval 气泡确认条
+                    # 让人工确认「主机 + 命令」，防中间人/误操作的兜底并未移除。
+                    auto_add_host_keys=True,
+                    approval=lambda host, cmd, user=None, port=None: approval.await_approval(
+                        {"action": "ssh", "host": host, "command": cmd,
+                         "user": user, "port": port}),
+                )
+                if registry.get_tool("ssh_exec") is None:
+                    registry.register_tool(ssh_tool)
+            except Exception:  # noqa: BLE001 —— 框架不兼容则跳过注册
+                ssh_tool = None
 
     # 浏览器自动化（Playwright，联动本机 Chrome）：打开网页 / 抓取 / 点击 / 填表 / 截图。
     # 与 SSH 同属「会改外部状态」的工具，需过 approval 确认闸门；非常驻，经 FindTools

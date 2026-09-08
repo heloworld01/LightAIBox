@@ -1,12 +1,14 @@
 """跨线程「运行时可写授权」协调器。
 
-智能体模式的文件写入（app/file_tools.py）跑在 _ChatWorker 派生的 asyncio 后台线程里，
-无法直接弹 GUI 确认框。ApprovalCoordinator 用 Qt Signal 把一次「写前确认」投递到主线程：
+智能体模式的文件写入（app/file_tools.py）与 SSH/浏览器等工具跑在后台线程里，无法直接
+弹 GUI 确认框。ApprovalCoordinator 用 Qt Signal 把一次「执行前/写前确认」投递到主线程：
 
     工具线程 await_approval(proposal)  →  emit approval_requested（跨线程 Queued）→ 阻塞等 Event
-    主线程   _on_approval_requested      →  弹 MessageBox.question → resolve(proposal, ok) 写回 + set
+    主线程   _on_approval_requested      →  以气泡内「确认/取消」条渲染（非弹窗）→ 用户点按钮后
+                                             resolve(proposal, ok) 写回 + set
 
 两线程互不占用对方事件循环，无死锁；await 超时（默认 120s）按「拒绝」处理，防卡死。
+如何呈现（气泡内按钮条 / 弹窗）由连接 approval_requested 的 UI 侧自行决定。
 """
 import threading
 from typing import Dict, Optional

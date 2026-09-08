@@ -48,7 +48,7 @@ from ..gateway import Gateway
 from ..chat_session import ChatSession
 from .i18n import LanguageManager
 from .theme_manager import ThemeManager
-from .widgets import MessageBox, SectionHeader
+from .widgets import SectionHeader
 from ..approval import ApprovalCoordinator
 from ..client import THINK_TAG, THINK_END_TAG
 from ..agent_bridge import (TOOL_TAG, TOOL_END_TAG, SUB_OPEN, STEP_OPEN,
@@ -295,9 +295,9 @@ class ChatPage(QWidget):
         self._approval.approval_requested.connect(self._on_approval_requested)
         # 待发送的图片（data URL 列表）：用户点「图片」按钮加入，随下一条消息发出
         self._pending_images: list = []
-        # 待确认的浏览器动作授权（非阻塞，改用气泡内「确认/取消」按钮而非弹窗）：
-        # token -> proposal。工具线程阻塞在 await_approval 上等用户点按钮；同一时刻
-        # 至多一个浏览器动作在等待（工具串行执行），但用 dict 以 token 键控保证安全。
+        # 待确认的授权（浏览器/SSH/文件写入）——非阻塞，改用气泡内「确认/取消」按钮
+        # 而非弹窗：token -> proposal。工具线程阻塞在 await_approval 上等用户点按钮；
+        # 同一时刻至多一个工具在等待（工具串行执行），但用 dict 以 token 键控保证安全。
         self._pending_approvals: dict = {}
         self._approval_seq = 0
         # 授权条超时自动清理：工具线程 await_approval 超时后（默认 120s）该提案已按
@@ -1275,78 +1275,47 @@ class ChatPage(QWidget):
 
     @Slot(object)
     def _on_approval_requested(self, proposal):
-        """（主线程）智能体要写文件时弹出确认框；把 Yes/No 写回协调器唤醒工具线程。
+        """（主线程）收到一次写前/执行前授权申请：统一改为气泡内「确认/取消」条（非弹窗）。
 
-        proposal：{action, kind, path, display, size}，由工具线程经 approval_requested
-        Signal 跨线程投递。模态弹窗会阻塞主线程事件循环——但工具线程此刻正阻塞在
-        Event.wait() 上，两者互不占用对方，不会死锁。
+        proposal 由工具线程经 approval_requested Signal 跨线程投递，形如：
+        - {action:"ssh", host, command, user?, port?}  —— SSH 远端执行
+        - {action:"写入文本文件"/"生成 Word 文档"/"生成 Excel 表格", kind, path, display, size}
+          —— 文件写入
+        - {action:"browser", browser_action, params}  —— 浏览器动作
+
+        工具线程此刻阻塞在 Event.wait() 上，等待用户在气泡内点按钮后 resolve。
+        一律**不弹模态框**（模态框会占据主线程事件循环，又叠加在助手流式渲染之上体验割裂），
+        改在回答气泡内渲染授权条，用户正常滚动/阅读时不被打断。所有工具统一走
+        _enqueue_approval，结构对齐浏览器工具的做法。
         """
-        # SSH 远程执行：proposal 携带 {action:"ssh", host, command}。远端代码执行属高危，
-        # 单独弹「允许 SSH 执行？」确认框，明示主机与命令。
-        if proposal.get("action") == "ssh":
-            title = self.tr("允许 SSH 执行？", "Allow SSH execution?")
-            text = self.tr(
-                "智能体请求通过 SSH 在远端执行命令：\n\n"
-                "主机：{host}\n"
-                "命令：{command}\n\n"
-                "是否允许执行？",
-                "The agent requests to run a command over SSH:\n\n"
-                "Host: {host}\nCommand: {command}\n\nAllow it?").format(
-                host=proposal.get("host", ""), command=proposal.get("command", ""))
-            yes = MessageBox.question(self, title, text) == QMessageBox.Yes
-            self._approval.resolve(proposal, yes)
-            return
+        self._enqueue_approval(proposal)
 
-        # 浏览器动作：proposal 携带 {action:"browser", browser_action, params}。会改页面
-        # 状态的动作（goto/click/fill 等）需人工确认——但**不弹模态框**，改在回答气泡
-        # 内渲染「确认/取消」按钮，用户点击后 resolve；工具线程仍阻塞在 Event.wait 上，
-        # 主线程事件循环不被占用，可正常点击按钮/滚动。
-        if proposal.get("action") == "browser":
-            self._approval_seq += 1
-            token = "b%d" % self._approval_seq
-            self._pending_approvals[token] = proposal
-            proposal["_token"] = token
-            # 授权条超时自动清理（与工具线程 await_approval 的超时对齐）
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(lambda t=token: self._expire_pending_approval(t))
-            timer.start(int(self._approval.timeout * 1000) + 1000)
-            self._approval_timers[token] = timer
-            # 立即渲染气泡内的授权条（此刻助手气泡可能只有工具状态行/空壳，强制贴底）
-            self._refresh_streaming(show_cursor=False)
-            return
+    def _enqueue_approval(self, proposal) -> None:
+        """把一次待确认授权挂进气泡内授权条（替代模态弹窗），随后立即重绘。
 
-        def _human(n: int) -> str:
-            if n < 1024:
-                return f"{n} 字节"
-            if n < 1024 * 1024:
-                return f"{n / 1024:.1f} KB"
-            return f"{n / 1024 / 1024:.1f} MB"
-
-        kind_map = {"txt": "文本", "docx": "Word 文档", "xlsx": "Excel 表格"}
-        kind = kind_map.get(proposal.get("kind", ""), proposal.get("kind", ""))
-        size_txt = _human(int(proposal.get("size", 0)))
-        title = self.tr("允许写入文件？", "Allow file write?")
-        text = self.tr(
-            "智能体请求生成以下文件：\n\n"
-            "类型：{kind}\n"
-            "文件：{display}\n"
-            "位置：{path}\n"
-            "大小：{size_txt}\n\n"
-            "是否允许写入？",
-            "The agent requests to create:\n\nType: {kind}\nFile: {display}\n"
-            "Location: {path}\nSize: {size_txt}\n\nAllow writing?").format(
-            kind=kind, display=proposal.get("display", ""),
-            path=proposal.get("path", ""), size_txt=size_txt)
-        yes = MessageBox.question(self, title, text) == QMessageBox.Yes
-        self._approval.resolve(proposal, yes)
+        浏览器/SSH/文件写入共用此入口：分配 token、登记到 _pending_approvals、挂超时
+        清理定时器，并强制刷新流式气泡让「确认/取消」按钮即刻可见。工具线程仍阻塞在
+        Event.wait() 上，用户点按钮 → _resolve_pending_approval 唤醒它。
+        """
+        self._approval_seq += 1
+        token = "b%d" % self._approval_seq
+        self._pending_approvals[token] = proposal
+        proposal["_token"] = token
+        # 授权条超时自动清理（与工具线程 await_approval 的超时对齐）
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda t=token: self._expire_pending_approval(t))
+        timer.start(int(self._approval.timeout * 1000) + 1000)
+        self._approval_timers[token] = timer
+        # 立即渲染气泡内的授权条（此刻助手气泡可能只有工具状态行/空壳，强制贴底）
+        self._refresh_streaming(show_cursor=False)
 
     def _resolve_pending_approval(self, token: str, ok: bool) -> None:
         """（主线程）处理气泡内「确认/取消」按钮点击：resolve 提案并唤醒工具线程。
 
         非阻塞：工具线程此刻仍阻塞在 Event.wait() 上，resolve 会即刻唤醒它继续执行
-        浏览器动作（或被拒绝后收到 PERMISSION_DENIED）。随后移除待确认项并重绘，
-        去掉授权条；流式继续时气泡会接着刷新。
+        （或被拒绝后收到拒绝结果）。随后移除待确认项并重绘，去掉授权条；流式继续时
+        气泡会接着刷新。
         """
         self._cancel_approval_timer(token)
         proposal = self._pending_approvals.pop(token, None)
@@ -1514,29 +1483,77 @@ class ChatPage(QWidget):
         return time_html + row
 
     def _pending_approval_bar_html(self) -> str:
-        """生成气泡内「浏览器动作确认/取消」按钮条（替代模态弹窗）。
+        """生成气泡内「确认/取消」按钮条（替代模态弹窗），供浏览器/SSH/文件写入共用。
 
         每个待确认提案一行：动作 + 参数摘要 + [确认][取消]，href 用
         chat:approve:<token> / chat:reject:<token> 编码，点击经 acceptNavigationRequest
-        转到 _on_anchor_clicked resolve 提案。无待确认时返回空串。
+        转到 _on_anchor_clicked resolve 提案。按 proposal["action"] 分流展示对应字段；
+        凭据（密码）一律不显示。无待确认时返回空串。
         """
         if not self._pending_approvals:
             return ""
         pal = _chat_palette()
         tr = self.tr
+
+        def _human(n: int) -> str:
+            if n < 1024:
+                return f"{n} 字节"
+            if n < 1024 * 1024:
+                return f"{n / 1024:.1f} KB"
+            return f"{n / 1024 / 1024:.1f} MB"
+
         rows: list = []
         for token, proposal in self._pending_approvals.items():
-            browser_action = proposal.get("browser_action", "")
-            params = proposal.get("params") or {}
-            detail = _html.escape(_short_repr(params, 200))
+            action = proposal.get("action", "")
             approve_href = f"chat:approve:{token}"
             reject_href = f"chat:reject:{token}"
+
+            # --- 头行：动作标签 + 唯一标识 + 摘要，按工具类型分流 ---
+            if action == "ssh":
+                # 远端代码执行：明示主机，命令做摘要；凭据（密码）由宿主脱敏，不显示。
+                host = proposal.get("host", "")
+                command = proposal.get("command", "")
+                _user = proposal.get("user") or ""
+                _port = proposal.get("port") or ""
+                cred = ""
+                if _user or _port:
+                    cred = " ｜{}: {} / 端口: {}".format(
+                        tr("用户", "user"), _user or tr("默认", "default"),
+                        _port or "22")
+                head = (
+                    f'<b>{tr("SSH 远程执行", "SSH execution")}</b> '
+                    f'<span style="color:{pal["meta"]};">→ {_html.escape(host)}'
+                    f'{_html.escape(cred)}</span>')
+                detail = f'<span style="color:{pal["meta"]};">{_html.escape(_short_repr(command, 160))}</span>'
+            elif action == "browser":
+                browser_action = proposal.get("browser_action", "")
+                params = proposal.get("params") or {}
+                detail = _html.escape(_short_repr(params, 200))
+                head = (
+                    f'<b>{tr("浏览器动作", "Browser action")}: '
+                    f'{_html.escape(browser_action)}</b>')
+            else:
+                # 文件写入：proposal 携带 kind/path/display/size。
+                kind_map = {"txt": "文本", "docx": "Word 文档", "xlsx": "Excel 表格"}
+                kind = kind_map.get(proposal.get("kind", ""), "")
+                size_txt = _human(int(proposal.get("size", 0)))
+                head = (
+                    f'<b>{tr("生成文件", "Create file")}: '
+                    f'{_html.escape(proposal.get("display", ""))}</b>'
+                    + (f'<span style="color:{pal["meta"]};">（{_html.escape(kind)} · {size_txt}）</span>'
+                       if kind else '')
+                    + f'<br><span style="color:{pal["meta"]};font-size:{self._font_size - 2}px;">'
+                      f'{_html.escape(proposal.get("path", ""))}</span>')
+                detail = ""
+
             rows.append(
                 f'<div style="margin-top:8px;font-size:{self._font_size - 1}px;'
-                f'color:{pal["meta"]};">'
-                f'🤖 {tr("浏览器动作", "Browser action")}: '
-                f'<b>{_html.escape(browser_action)}</b> '
-                f'<span style="color:{pal["meta"]};">{detail}</span></div>')
+                f'color:{pal["assistant_text"]};">'
+                f'🤖 {head}</div>')
+            if detail:
+                rows.append(
+                    f'<div style="margin-top:2px;font-size:{self._font_size - 1}px;'
+                    f'color:{pal["meta"]};">{detail}</div>')
             rows.append(
                 f'<div style="margin-top:6px;">'
                 f'<a href="{approve_href}" style="display:inline-block;'
