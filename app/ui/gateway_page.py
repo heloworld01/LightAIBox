@@ -395,6 +395,9 @@ class _RefreshWorker(QThread):
 # 网关页
 # --------------------------------------------------------------------------- #
 class GatewayPage(QWidget):
+    # 悬浮面板开关：由主窗口连接，切换 ProvidersBar 的显示/隐藏
+    toggle_bar_requested = Signal(bool)
+
     def __init__(self, gateway: Gateway, parent=None):
         super().__init__(parent)
         self.gateway = gateway
@@ -508,18 +511,20 @@ class GatewayPage(QWidget):
         pb.addWidget(self.copy_btn)
         pb.addWidget(self.del_btn)
         pb.addWidget(self.reset_btn)
-        pb.addSpacing(12)
-        self._toolbar_sep = QFrame()
-        self._toolbar_sep.setProperty("class", "v-separator")
-        self._toolbar_sep.setFrameShape(QFrame.VLine)
-        pb.addWidget(self._toolbar_sep)
+        pb.addWidget(self.import_btn)
+        pb.addWidget(self.export_btn)
+        pb.addStretch()
         self.up_btn = QPushButton(self.tr("↑ 上移", "↑ Up"))
         self.up_btn.setProperty("class", "ghost")
         self.down_btn = QPushButton(self.tr("↓ 下移", "↓ Down"))
         self.down_btn.setProperty("class", "ghost")
+        # 悬浮面板开关：点击经 toggle_bar_requested 交主窗口切换 ProvidersBar（见 main_window）
+        self.bar_btn = QPushButton(self.tr("悬浮面板", "Floating bar"))
+        self.bar_btn.setProperty("class", "ghost")
+        self.bar_btn.setCheckable(True)
         pb.addWidget(self.up_btn)
         pb.addWidget(self.down_btn)
-        pb.addStretch()
+        pb.addWidget(self.bar_btn)
         lv.addLayout(pb)
 
         self.add_btn.clicked.connect(self._on_add_provider)
@@ -531,6 +536,7 @@ class GatewayPage(QWidget):
         self.export_btn.clicked.connect(self._on_export_providers)
         self.up_btn.clicked.connect(lambda: self._on_move(-1))
         self.down_btn.clicked.connect(lambda: self._on_move(1))
+        self.bar_btn.clicked.connect(self._on_toggle_bar)
 
         # ---- 右：调用记录 ----
         right = QWidget()
@@ -651,6 +657,7 @@ class GatewayPage(QWidget):
         self.export_btn.setText(tr("导出", "Export"))
         self.up_btn.setText(tr("↑ 上移", "↑ Up"))
         self.down_btn.setText(tr("↓ 下移", "↓ Down"))
+        self.bar_btn.setText(tr("悬浮面板", "Floating bar"))
         self.log_header.title_label.setText(tr("调用记录", "Call Logs"))
         self.log_date_label.setText(tr("日期:", "Date:"))
         self._rebuild_date_items()
@@ -927,6 +934,22 @@ class GatewayPage(QWidget):
         p.disable_reason = ""
         self.gateway.providers.upsert(p)
         self.refresh_providers()
+
+    # ------------------------------------------------------------------ #
+    # 悬浮面板开关
+    # ------------------------------------------------------------------ #
+    def _on_toggle_bar(self, checked: bool):
+        """悬浮面板按钮：转发给主窗口切换 ProvidersBar 显示/隐藏。"""
+        self.toggle_bar_requested.emit(checked)
+
+    def _sync_bar_button(self, on: bool):
+        """由主窗口回调：让网关页的悬浮面板按钮反映实际开 / 关状态。"""
+        self.bar_btn.setChecked(on)
+        self.bar_btn.setText(self.tr("悬浮面板", "Floating bar"))
+        self.bar_btn.setToolTip(
+            self.tr("开关 Provider 悬浮面板（当前：开）"
+                    if on else "开关 Provider 悬浮面板（当前：关）",
+                    "Toggle the floating providers bar"))
 
     # ------------------------------------------------------------------ #
     # Import / Export

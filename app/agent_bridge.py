@@ -102,6 +102,18 @@ class AgentChatSession:
         """清空跨轮记忆（新建/切换会话、清理上下文时调用），不重建工具目录。"""
         self._history = []
 
+    def shutdown(self) -> None:
+        """释放工具注册表里持有外部资源的工具（当前仅浏览器）。
+
+        由 ChatPage 在窗口 / 进程退出前调用：让 BrowserTool 在解释器仍正常、事件循环
+        线程仍存活时**主动**脱离 Playwright 监管，从而保留桌面 Chrome——避免关程序时
+        GC 被动 close 连带杀掉用户正看着的浏览器窗口。
+        """
+        if self._registry is None:
+            return
+        from .gateway_llm import close_registry_tools
+        close_registry_tools(self._registry)
+
     def _ensure_run(self):
         """惰性构建并**复用**桌面工具注册表/目录与编排器。
 

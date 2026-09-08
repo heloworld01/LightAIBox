@@ -152,13 +152,22 @@ Key properties:
   but are discovered via FindTools when you ask about the weather or where you are.
 - **Browser automation (Playwright)** — the `browser` tool can genuinely **open a web page**,
   extract visible text, click / fill / scroll / press keys, run JS and take screenshots,
-  driving your local Google Chrome. When the page needs login / a CAPTCHA, it tells you to
-  finish it manually in the Chrome window and then keeps going. It's discovered on demand
-  (ask to "open the browser / visit a web page / search on a site"); **state-changing
-  actions** (`goto` / `click` / `fill` …) are gated behind a confirmation dialog showing the
-  action and its parameters, while read-only grabs (text / screenshot) run freely. *Note: it
-  opens Chrome headless by default (invisible) for extracting content; a visible window is
-  intended for demo / screen-capture use.*
+  driving your local Google Chrome in a **visible (headed) window**. It's discovered on
+  demand (ask to "open the browser / visit a web page / search on a site");
+  **state-changing actions** (`goto` / `click` / `fill` …) are gated behind a confirmation
+  prompt inside the reply bubble showing the action and its parameters, while read-only
+  grabs (text / screenshot) run freely. On top of the raw actions it:
+  - **Heads-up authentication** — when a page needs login / a CAPTCHA it prompts you to
+    finish it manually in the Chrome window, then keeps going.
+  - **Reuses a persistent profile** — the tool prefers to attach to / relaunch a **dedicated
+    persistent Chrome profile** (and, if you run Chrome on the tool's debug port, to that
+    instance directly), so your login cookies survive across sessions and you aren't treated
+    as a fresh zero-trust device on every visit.
+  - **Avoids automation fingerprints** — headed mode launches without
+    `--no-sandbox` / `--disable-dev-shm-usage` style flags that sites like Baidu read as
+    bot signals, which cuts down on repeated CAPTCHA / human-verification prompts.
+  - **Keeps the window alive on exit** — closing LightAIBox detaches the browser instead of
+    killing it, so the page stays open on your desktop for you to keep reading.
 - **SSH remote commands (Python)** — with an approved remote host, the `ssh_exec` tool runs
   commands on a server over SSH. **Every execution pops a
   confirmation dialog showing the host and the command** before it runs; credentials come from

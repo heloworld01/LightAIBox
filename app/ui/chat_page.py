@@ -295,6 +295,15 @@ class ChatPage(QWidget):
         self._approval.approval_requested.connect(self._on_approval_requested)
         # 待发送的图片（data URL 列表）：用户点「图片」按钮加入，随下一条消息发出
         self._pending_images: list = []
+        # 待确认的浏览器动作授权（非阻塞，改用气泡内「确认/取消」按钮而非弹窗）：
+        # token -> proposal。工具线程阻塞在 await_approval 上等用户点按钮；同一时刻
+        # 至多一个浏览器动作在等待（工具串行执行），但用 dict 以 token 键控保证安全。
+        self._pending_approvals: dict = {}
+        self._approval_seq = 0
+        # 授权条超时自动清理：工具线程 await_approval 超时后（默认 120s）该提案已按
+        # 「拒绝」处理并继续，但 _pending_approvals 里的条目与气泡内按钮不会自动消失；
+        # 用单次定时器在其超时后移除，避免残留的「确认/取消」按钮误导用户。
+        self._approval_timers: dict = {}
         # 底部瞬时提示（调用失败 / 已停止），随消息流一起注入视图底部
         self._notice_html: str = ""
         # WebView 页面（含 MathJax）是否已加载完成；加载前不注入，避免
@@ -1230,8 +1239,14 @@ class ChatPage(QWidget):
 
     @Slot(QUrl)
     def _on_anchor_clicked(self, url):
-        """处理气泡内切换链接点击，翻转对应消息的显示格式并重放。"""
+        """处理气泡内链接点击：切换显示格式 / 浏览器动作授权的确认与取消。"""
         href = url.toString()
+        if href.startswith("chat:approve:"):
+            self._resolve_pending_approval(href[len("chat:approve:"):], True)
+            return
+        if href.startswith("chat:reject:"):
+            self._resolve_pending_approval(href[len("chat:reject:"):], False)
+            return
         if href.startswith("chat:raw:"):
             self._render_raw[int(href[len("chat:raw:"):])] = True
         elif href.startswith("chat:md:"):
@@ -1283,22 +1298,22 @@ class ChatPage(QWidget):
             return
 
         # 浏览器动作：proposal 携带 {action:"browser", browser_action, params}。会改页面
-        # 状态的动作（goto/click/fill 等）需人工确认，明示动作与关键参数。
+        # 状态的动作（goto/click/fill 等）需人工确认——但**不弹模态框**，改在回答气泡
+        # 内渲染「确认/取消」按钮，用户点击后 resolve；工具线程仍阻塞在 Event.wait 上，
+        # 主线程事件循环不被占用，可正常点击按钮/滚动。
         if proposal.get("action") == "browser":
-            browser_action = proposal.get("browser_action", "")
-            params = proposal.get("params") or {}
-            detail = _html.escape(_short_repr(params))
-            title = self.tr("允许浏览器执行动作？", "Allow browser action?")
-            text = self.tr(
-                "智能体请求在浏览器中执行动作：\n\n"
-                "动作：{action}\n"
-                "参数：{params}\n\n"
-                "是否允许？",
-                "The agent requests a browser action:\n\n"
-                "Action: {action}\nParams: {params}\n\nAllow it?").format(
-                action=browser_action, params=detail)
-            yes = MessageBox.question(self, title, text) == QMessageBox.Yes
-            self._approval.resolve(proposal, yes)
+            self._approval_seq += 1
+            token = "b%d" % self._approval_seq
+            self._pending_approvals[token] = proposal
+            proposal["_token"] = token
+            # 授权条超时自动清理（与工具线程 await_approval 的超时对齐）
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda t=token: self._expire_pending_approval(t))
+            timer.start(int(self._approval.timeout * 1000) + 1000)
+            self._approval_timers[token] = timer
+            # 立即渲染气泡内的授权条（此刻助手气泡可能只有工具状态行/空壳，强制贴底）
+            self._refresh_streaming(show_cursor=False)
             return
 
         def _human(n: int) -> str:
@@ -1325,6 +1340,41 @@ class ChatPage(QWidget):
             path=proposal.get("path", ""), size_txt=size_txt)
         yes = MessageBox.question(self, title, text) == QMessageBox.Yes
         self._approval.resolve(proposal, yes)
+
+    def _resolve_pending_approval(self, token: str, ok: bool) -> None:
+        """（主线程）处理气泡内「确认/取消」按钮点击：resolve 提案并唤醒工具线程。
+
+        非阻塞：工具线程此刻仍阻塞在 Event.wait() 上，resolve 会即刻唤醒它继续执行
+        浏览器动作（或被拒绝后收到 PERMISSION_DENIED）。随后移除待确认项并重绘，
+        去掉授权条；流式继续时气泡会接着刷新。
+        """
+        self._cancel_approval_timer(token)
+        proposal = self._pending_approvals.pop(token, None)
+        if proposal is not None:
+            self._approval.resolve(proposal, ok)
+        # 移除后重绘：授权条消失；流式中走增量刷新，否则重建整段视图兜底。
+        if self._worker is not None:
+            self._refresh_streaming(show_cursor=False)
+        else:
+            self._reset_history_view(force=True)
+
+    def _expire_pending_approval(self, token: str) -> None:
+        """授权条超时：工具线程已把提案按「拒绝」处理并继续，这里移除残留按钮。
+
+        不再次 resolve（工具线程早已超时自己返回拒绝），只清 UI 状态避免误导。
+        """
+        self._cancel_approval_timer(token)
+        if token in self._pending_approvals:
+            self._pending_approvals.pop(token)
+            if self._worker is not None:
+                self._refresh_streaming(show_cursor=False)
+            else:
+                self._reset_history_view(force=True)
+
+    def _cancel_approval_timer(self, token: str) -> None:
+        timer = self._approval_timers.pop(token, None)
+        if timer is not None:
+            timer.stop()
 
     def _empty_hint_html(self) -> str:
         pal = _chat_palette()
@@ -1383,8 +1433,9 @@ class ChatPage(QWidget):
                     show_time=show_time, mtime=ts, thinking=thinking,
                     images=images, tools=m.get("_tools"),
                     agent_blocks=m.get("_agent_blocks")))
-        if self._pending_assistant:
-            # 流式中：整条视为「新的一段时间」，仅在最新一条之后显示时间
+        if self._pending_assistant or self._pending_approvals:
+            # 流式中：整条视为「新的一段时间」，仅在最新一条之后显示时间。正文尚未开始
+            # 但有待确认的浏览器授权时也要渲染（授权条自身即是可见内容）。
             now = _time.time()
             show_time = not parts or (last_ts is None or now - last_ts > 300)
             parts.append(self._render_streaming_bubble(show_time=show_time, mtime=now))
@@ -1413,24 +1464,93 @@ class ChatPage(QWidget):
         tools = list(self._pending_tools) or None
         now = mtime if mtime is not None else _time.time()
         show_time = show_time or not (len(self.session.messages) > 0)
+        # 待确认的浏览器动作授权条（气泡内「确认/取消」按钮，非阻塞）。
+        approve_bar = self._pending_approval_bar_html()
         # 智能体模式结构化流式：步骤按子任务/步骤分组随流渲染（每 token 都刷新），
         # 不混入正文；正文仍由 _pending_assistant 保留为原文（原文/渲染切换用）。
         if self._structured:
             blocks = self._agent_live_blocks()
-            if not blocks:
+            has_body = bool(blocks) and bool(
+                self._agent_sections_html(blocks, self._font_size).strip())
+            # 无正文但有授权条时：只渲染授权条（包在助手行里），避免空气泡。
+            if not has_body and approve_bar:
+                return self._approval_only_row_html(approve_bar, show_time, now)
+            # 无正文也无授权条：空（挡掉「有壳无肉」的空气泡）。
+            if not has_body:
                 return ""
-            return self._render_block(
+            bubble = self._render_block(
                 _ROLE_ASSISTANT, text,
                 font_size=self._font_size, show_time=show_time, mtime=now,
                 thinking=thinking, tools=tools,
                 agent_blocks=blocks)
-        # 正文为空但有思考/工具活动时也要渲染（智能体工具循环阶段能看到状态行）
-        if not (text or thinking or tools):
+            return bubble + approve_bar
+        # 正文为空但有思考/工具活动时也要渲染（智能体工具循环阶段能看到状态行）。
+        # 同时对正文/思考做 strip 判空：首个 token 若只有换行/空白会渲染出空 markdown
+        # 气泡（空气泡 + 分离的尾巴），这里一并挡住。待确认的授权条除外。
+        has_body = bool(text.strip() or thinking.strip() or tools)
+        if not has_body and approve_bar:
+            return self._approval_only_row_html(approve_bar, show_time, now)
+        if not has_body:
             return ""
         return self._render_block(
             _ROLE_ASSISTANT, text,
             font_size=self._font_size, show_time=show_time, mtime=now,
-            thinking=thinking, tools=tools)
+            thinking=thinking, tools=tools) + approve_bar
+
+    def _approval_only_row_html(self, approve_bar: str, show_time: bool,
+                                mtime: float | None) -> str:
+        """仅有待确认授权、尚无正文时：渲染「助手头像 + 授权条」的最小行。
+
+        复用 _render_block 的骨架布局（头像在左、内容在右），但气泡换成无底色的
+        授权条容器，避免出现内容为空的圆角矩形气泡 + 分离尾巴。
+        """
+        col = (f'<div style="display:flex;flex-direction:column;'
+               f'align-items:flex-start;max-width:80%;min-width:0;'
+               f'margin:8px 0;">{approve_bar}</div>')
+        row = (f'<div style="display:flex;align-items:flex-start;'
+               f'gap:8px;margin:12px 0;flex-direction:row;">'
+               f'{self._avatar_html(_ROLE_ASSISTANT)}{col}</div>')
+        time_html = self._time_chip_html(mtime) if (show_time and mtime) else ""
+        return time_html + row
+
+    def _pending_approval_bar_html(self) -> str:
+        """生成气泡内「浏览器动作确认/取消」按钮条（替代模态弹窗）。
+
+        每个待确认提案一行：动作 + 参数摘要 + [确认][取消]，href 用
+        chat:approve:<token> / chat:reject:<token> 编码，点击经 acceptNavigationRequest
+        转到 _on_anchor_clicked resolve 提案。无待确认时返回空串。
+        """
+        if not self._pending_approvals:
+            return ""
+        pal = _chat_palette()
+        tr = self.tr
+        rows: list = []
+        for token, proposal in self._pending_approvals.items():
+            browser_action = proposal.get("browser_action", "")
+            params = proposal.get("params") or {}
+            detail = _html.escape(_short_repr(params, 200))
+            approve_href = f"chat:approve:{token}"
+            reject_href = f"chat:reject:{token}"
+            rows.append(
+                f'<div style="margin-top:8px;font-size:{self._font_size - 1}px;'
+                f'color:{pal["meta"]};">'
+                f'🤖 {tr("浏览器动作", "Browser action")}: '
+                f'<b>{_html.escape(browser_action)}</b> '
+                f'<span style="color:{pal["meta"]};">{detail}</span></div>')
+            rows.append(
+                f'<div style="margin-top:6px;">'
+                f'<a href="{approve_href}" style="display:inline-block;'
+                f'padding:3px 12px;margin-right:8px;border-radius:6px;'
+                f'background:{pal["user_avatar"]};color:{pal["user_avatar_text"]};'
+                f'text-decoration:none;font-weight:600;font-size:{self._font_size - 1}px;">'
+                f'{tr("确认", "Confirm")}</a>'
+                f'<a href="{reject_href}" style="display:inline-block;'
+                f'padding:3px 12px;border-radius:6px;'
+                f'background:transparent;color:{pal["meta"]};'
+                f'border:1px solid {pal["meta"]};text-decoration:none;'
+                f'font-size:{self._font_size - 1}px;">'
+                f'{tr("取消", "Cancel")}</a></div>')
+        return "".join(rows)
 
     def _refresh_streaming(self, show_cursor: bool = True) -> None:
         """流式增量：只重建并刷入最后一条进行中气泡（受防抖合并）。
@@ -1957,6 +2077,15 @@ class ChatPage(QWidget):
         self._pending_assistant = []
         self._pending_thinking = []
         self._pending_tools = []
+        # 本轮结束/停止/清空：把仍挂起的浏览器授权全部按「取消」收尾，唤醒工具线程
+        # （避免其阻塞到 120s 超时），并清空授权条状态与超时定时器。
+        for token, proposal in list(self._pending_approvals.items()):
+            self._cancel_approval_timer(token)
+            self._approval.resolve(proposal, False)
+        self._pending_approvals.clear()
+        for timer in self._approval_timers.values():
+            timer.stop()
+        self._approval_timers.clear()
         # 重置智能体流式结构状态（下轮从干净状态开始）
         self._pending_blocks = []
         self._cur_sub = None
@@ -2010,6 +2139,13 @@ class ChatPage(QWidget):
         self._worker = None
         self._zombie_workers = []
         self._zombie_timer.stop()
+        # 释放智能体工具持有的外部资源（浏览器）：在进程正常时主动让 Chrome 脱离
+        # Playwright 监管存活，避免关程序连带杀掉对话里打开的浏览器窗口。
+        if self._agent_session is not None:
+            try:
+                self._agent_session.shutdown()
+            except Exception:  # noqa: BLE001 —— 退出收尾尽力而为
+                pass
 
     def closeEvent(self, event):
         self.shutdown()

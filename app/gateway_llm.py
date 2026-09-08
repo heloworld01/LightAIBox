@@ -1021,6 +1021,30 @@ class DesktopToolAdapter:
         return {"name": self.name, "description": self.description}
 
 
+def close_registry_tools(registry) -> None:
+    """进程退出前主动释放注册表里持有外部资源的工具（当前仅 BrowserTool）。
+
+    必须**显式、且早于解释器关闭阶段**调用：BrowserTool 用 Playwright 把本机 Chrome
+    作为子进程托管。若放任其随 Python GC 在 __del__ 里被动 close，进程死亡时 Node
+    驱动管道断裂，Playwright 会连带把它托管的 Chrome 一并杀掉——表现为「关程序 →
+    对话打开的浏览器也消失」。这里走干净路径：先 context.close() 让 Chrome 脱离驱动
+    监管存活，再停 playwright 驱动；最后单独停掉常驻事件循环（见 release_browser）。
+    """
+    if registry is None:
+        return
+    try:
+        tools = list(registry.get_all_tools())
+    except Exception:  # noqa: BLE001
+        return
+    for t in tools:
+        if type(t).__name__ != "BrowserTool":
+            continue
+        try:
+            t.release_browser()   # 见 browser_tool.py：保 Chrome 存活地释放句柄
+        except Exception:  # noqa: BLE001 —— 退出收尾尽力而为，绝不影响主流程
+            pass
+
+
 def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
                            session_dir: Optional[str] = None,
                            approval=None):
@@ -1119,6 +1143,13 @@ def build_desktop_registry(gateway: Gateway, provider_id: Optional[int] = None,
         try:
             from light_agents.tools.builtin.browser_tool import BrowserTool  # noqa: PLC0415
             browser_tool = BrowserTool(
+                # 对话窗里的「打开网页 / 访问网址」是「替用户打开并让人看」的语义，
+                # 必须用有头模式弹出可见的 Chrome 窗口；无头(默认)只在后台渲染+截图，
+                # 用户看不到任何窗口，会造成「没打开浏览器」的错觉。
+                headless=False,
+                # auto_find_running_chrome 默认 True：优先接管本机真实 Chrome（复用登录态
+                # 与指纹，降低百度等站点的安全/人机验证）——先接管运行中调试端口实例，再
+                # 尝试以真实 User Data 带调试端口拉起，最后才回退隔离 profile。
                 approval=lambda action, params: approval.await_approval(
                     {"action": "browser", "browser_action": action, "params": params}),
             )

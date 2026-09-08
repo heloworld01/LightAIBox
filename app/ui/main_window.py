@@ -198,6 +198,9 @@ class MainWindow(QMainWindow):
 
         self.gateway_page = GatewayPage(gateway)
         self.tabs.addTab(self.gateway_page, self.lang.tr("AI 网关", "AI Gateway"))
+        # 悬浮面板开关已迁入网关页 Provider 工具条（上移/下移右侧），
+        # 这里把网关页按钮的开关信号接到主窗口的面板显示逻辑。
+        self.gateway_page.toggle_bar_requested.connect(self._on_gateway_bar_toggled)
 
         self.api_page = ApiPage(gateway, server)
         self.tabs.addTab(self.api_page, self.lang.tr("统一 API", "Unified API"))
@@ -434,13 +437,6 @@ class MainWindow(QMainWindow):
         self.lang_btn.clicked.connect(self._on_toggle_language)
         layout.addWidget(self.lang_btn)
 
-        # 透明悬浮 Provider 面板开关
-        self.bar_btn = QPushButton()
-        self.bar_btn.setProperty("class", "ghost")
-        self.bar_btn.setCheckable(True)
-        self.bar_btn.clicked.connect(self._on_toggle_bar)
-        layout.addWidget(self.bar_btn)
-
         # 无边框窗口没有原生最小化/最大化/关闭按钮，这里补一组（自绘图标，
         # 保证「方框 / 重叠方框」等图标视觉尺寸一致）
         self.min_btn = WindowControlButton(WindowControlButton.KIND_MIN)
@@ -505,28 +501,23 @@ class MainWindow(QMainWindow):
         self.lang.toggle()
         self._retranslate()
 
-    def _on_toggle_bar(self):
-        """开关透明悬浮 Provider 面板（会话内生效，不跨重启记忆）。"""
-        on = self.bar_btn.isChecked()
+    def _on_gateway_bar_toggled(self, on: bool):
+        """网关页悬浮面板按钮被点击：切换 ProvidersBar 显示/隐藏并同步状态。"""
         self.providers_bar.set_bar_visible(on)
         self._sync_bar_controls()
 
     def _on_bar_closed(self, _visible: bool):
-        """面板内「关闭」按钮触发：同步角落开关按钮状态。"""
-        # bar_btn 在 _build_controls() 里创建，晚于面板；启动早期面板被隐藏时
-        # 会拿不到 bar_btn，须防护。
-        if hasattr(self, "bar_btn"):
+        """面板内「关闭」按钮触发：同步网关页开关按钮状态。"""
+        # 网关页按钮在网关页构造时创建，早于面板；但启动早期面板被隐藏时
+        # 可能还未就绪，须防护。
+        if hasattr(self, "gateway_page"):
             self._sync_bar_controls()
 
     def _sync_bar_controls(self):
         """让悬浮面板开关按钮反映当前开 / 关状态。"""
         on = self.providers_bar.isVisible()
-        self.bar_btn.setChecked(on)
-        self.bar_btn.setText(self.lang.tr("悬浮面板", "Floating bar"))
-        self.bar_btn.setToolTip(
-            self.lang.tr("开关 Provider 悬浮面板（当前：开）"
-                         if on else "开关 Provider 悬浮面板（当前：关）",
-                         "Toggle the floating providers bar"))
+        if hasattr(self, "gateway_page"):
+            self.gateway_page._sync_bar_button(on)
 
     # ------------------------------------------------------------------ #
     # 无边框窗口拖动：按住任意「非交互」空白处（Tab 栏空白、页面容器背景等）
