@@ -435,12 +435,15 @@ class ChatPage(QWidget):
         self._pending_html: str | None = None
         self._pending_stick: bool = True
         self._pending_force_pin: bool = False
-        # 增量流式：只更新「最后一条进行中气泡」的 HTML（走 __appendStreaming）
-        self._pending_stream_html: str | None = None
-        self._pending_stream_cursor: bool = True
+        # 增量流式：只更新「最后一条进行中气泡」的 HTML（走 __appendStreaming）。
+        # 重建结果不再暂存字符串：由 _flush_stream 到期时现建现推（见 _stream_dirty）。
         # 自适应刷盘节奏：按最近 token 到达间隔调整合并窗
         self._gap_ema: float | None = None
         self._last_token_ts: float | None = None
+        # 增量流式脏标记：token 到达只置位，HTML 重建推迟到定时器触发时做
+        # （O(n) 的整段 markdown 渲染从「每 token」降为「每合并窗」一次）。
+        self._stream_dirty: bool = False
+        self._stream_cursor: bool = True
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
         self._flush_timer.setInterval(120)
@@ -941,7 +944,8 @@ class ChatPage(QWidget):
                       show_time: bool = False, mtime: float | None = None,
                       thinking: str = "", images: list | None = None,
                       tools: list | None = None,
-                      agent_blocks: list | None = None) -> str:
+                      agent_blocks: list | None = None,
+                      agent_body: str | None = None) -> str:
         """把一条消息渲染为微信式气泡（圆形头像 + 带头尾气泡）。
 
         布局（flex）：assistant 头像在左、气泡在右；user 头像在右、气泡在左。
@@ -953,6 +957,9 @@ class ChatPage(QWidget):
         每个子任务一块，其内部各 ReAct 步骤（模型正文 + 思考 + 工具活动）与
         该步骤放在一起展示；多子任务时的 LLM 汇总作为最终回答置顶/置尾。
         此时消息级的 thinking/tools 已被并入步骤块，不再单独渲染，避免重复。
+
+        agent_body：可选，调用方已预渲染好的结构化分区 HTML（流式下用于避免与
+        判空重复渲染整套 markdown）。提供时直接作为正文，不再内部重渲。
         """
         pal = _chat_palette()
         text = str(text)
@@ -974,9 +981,10 @@ class ChatPage(QWidget):
         if role == _ROLE_ASSISTANT:
             raw = msg_index is not None and self._render_raw.get(msg_index, False)
             if agent_blocks:
-                # 结构化步骤视图：正文即各子任务块 + 汇总；原文视图仍显示整段 markdown
+                # 结构化步骤视图：正文即各子任务块 + 汇总；原文视图仍显示整段 markdown。
+                # 调用方已预渲染（agent_body，流式判空共用）时直接用，避免重渲整套 markdown。
                 body = (_html.escape(text).replace("\n", "<br>") if raw
-                        else self._agent_sections_html(agent_blocks, font_size))
+                        else (agent_body or self._agent_sections_html(agent_blocks, font_size)))
             else:
                 body = (_html.escape(text).replace("\n", "<br>") if raw
                         else self._render_markdown(text, font_size))
@@ -1439,8 +1447,11 @@ class ChatPage(QWidget):
         # 不混入正文；正文仍由 _pending_assistant 保留为原文（原文/渲染切换用）。
         if self._structured:
             blocks = self._agent_live_blocks()
-            has_body = bool(blocks) and bool(
-                self._agent_sections_html(blocks, self._font_size).strip())
+            # 预先渲染一次结构化分区 HTML：判空与最终气泡共用同一份，避免为判空
+            # 重复 _agent_sections_html（整套 markdown）一次。
+            body = (self._agent_sections_html(blocks, self._font_size)
+                    if blocks else "")
+            has_body = bool(body.strip())
             # 无正文但有授权条时：只渲染授权条（包在助手行里），避免空气泡。
             if not has_body and approve_bar:
                 return self._approval_only_row_html(approve_bar, show_time, now)
@@ -1451,7 +1462,7 @@ class ChatPage(QWidget):
                 _ROLE_ASSISTANT, text,
                 font_size=self._font_size, show_time=show_time, mtime=now,
                 thinking=thinking, tools=tools,
-                agent_blocks=blocks)
+                agent_blocks=blocks, agent_body=body)
             return bubble + approve_bar
         # 正文为空但有思考/工具活动时也要渲染（智能体工具循环阶段能看到状态行）。
         # 同时对正文/思考做 strip 判空：首个 token 若只有换行/空白会渲染出空 markdown
@@ -1570,21 +1581,21 @@ class ChatPage(QWidget):
         return "".join(rows)
 
     def _refresh_streaming(self, show_cursor: bool = True) -> None:
-        """流式增量：只重建并刷入最后一条进行中气泡（受防抖合并）。
+        """流式增量：标记脏并按合并窗刷新最后一条进行中气泡。
 
-        仅当 worker 存在（真在流式）时合并刷盘；worker 已停则直接即时推流式节点
-        （罕见，作为兜底）。
+        关键优化：token 到达时**不再**同步重建整段气泡 HTML（整段 markdown 渲染是
+        O(全文长度)，每 token 一次会吃满 GUI 线程），而是只置脏标记、由定时器在
+        合并窗到期时统一重建一次。授权确认等「无后续 token 到来」的场景走前沿触发
+        （立即重建并启动尾沿定时器），保证按钮条即时可见、点击后即时消失。
         """
-        html = self._render_streaming_bubble()
-        if not html:
-            return
+        self._stream_dirty = True
+        self._stream_cursor = show_cursor
+        # worker 已停（罕见兜底 / 授权态变化）：没有后续 token 会再触发重建，
+        # 立即重建并推送，同时启动尾沿定时器做节流，避免高频调用时退化为每调用一次重排一次。
         if self._worker is None:
-            self._pending_stream_html = None
-            self._flush_timer.stop()
-            self._push_streaming(html, show_cursor)
+            self._flush_stream()
+            self._flush_timer.start(150)
             return
-        self._pending_stream_html = html
-        self._pending_stream_cursor = show_cursor
         # 自适应合并窗：token 快速到达（gaps 小）时放宽到 ~180ms 批量合并，
         # 慢节奏（思考/工具等待的静默缝隙）时收紧到 ~90ms，让画面尽快跟上。
         now = _time.monotonic()
@@ -1597,6 +1608,10 @@ class ChatPage(QWidget):
         interval = int(max(90, min(200, 120 + (0.020 - ema) * 4000)))
         if self._flush_timer.interval() != interval:
             self._flush_timer.setInterval(interval)
+        # 前沿触发：定时器未在跑（静默后的第一枚 token / 授权态变化）时立刻重建一次，
+        # 消除「首 token 延迟一个合并窗才显示」与按钮条延迟；随后 start() 转入尾沿节流。
+        if not self._flush_timer.isActive():
+            self._flush_stream()
         self._flush_timer.start()
 
     def _push_streaming(self, html: str, show_cursor: bool = True) -> None:
@@ -1617,11 +1632,14 @@ class ChatPage(QWidget):
         self.view.page().runJavaScript("window.__streamStop && window.__streamStop();")
 
     def _flush_stream(self) -> None:
-        """防抖定时器触发：优先刷增量流式节点，否则刷整段历史。"""
-        if self._pending_stream_html is not None:
-            self._push_streaming(self._pending_stream_html,
-                                 self._pending_stream_cursor)
-            self._pending_stream_html = None
+        """防抖定时器触发：优先重建并刷入增量流式节点，否则刷整段历史。"""
+        if self._stream_dirty:
+            self._stream_dirty = False
+            html = self._render_streaming_bubble()
+            # 空串 = 「暂无可见正文且无授权条」的空气泡挡门；不清脏标记以外的状态，
+            # 等下一个 token / 事件再试（有真实内容或授权变化时必然再次置脏）。
+            if html:
+                self._push_streaming(html, self._stream_cursor)
             return
         if self._pending_html is None:
             return
@@ -2023,7 +2041,18 @@ class ChatPage(QWidget):
 
     @Slot(object)
     def _on_finished(self, result):
+        # 先确定本轮的结构化产出（优先流式就地构建的块，回退到 result.agent_blocks）。
+        # 必须在创建助手消息之前算好：单子任务问答（如纯工具收尾的天气问题）最终答案
+        # 只落在 sub_block["answer"] → SUB_ANSWER，不进 _pending_assistant，导致 full
+        # 为空；若仍按「if full 才建气泡」就会整条回答不显示（日志却有答案）。
+        blocks = self._finalize_agent_blocks() if self._structured else []
+        if result is not None and getattr(result, "agent_blocks", None):
+            blocks = blocks or list(result.agent_blocks)
         full = "".join(self._pending_assistant)
+        if not full.strip():
+            # 正文为空时用结构化块的可见文本兜底作为消息原文（保证气泡有内容、
+            # 且后续 _meta/_thinking/_tools/_agent_blocks 挂到正确的助手消息上）。
+            full = self._fallback_full_text(blocks, result)
         if result is not None:
             # 智能体模式（多次底层调用）展示调用次数与提示/输出拆分，使总 token
             # 数值可解释、可在「调用记录」页逐笔核对；普通模式维持单一总数。
@@ -2042,29 +2071,29 @@ class ChatPage(QWidget):
                 zh = (f"{result.total_tokens:,} tokens · "
                       f"{result.elapsed_ms / 1000:.1f}s")
             self._last_stats = self.tr(zh, en)
-        if full:
+        # 只要本轮有任何产出（正文 / 思考 / 工具 / 结构化块）就建一条助手消息承载，
+        # 避免答案只在结构化块里时被 if full 挡掉、整条回答不上屏。
+        has_output = bool(full.strip() or self._pending_thinking
+                          or self._pending_tools or blocks)
+        if has_output:
             # 将统计与思考内容内嵌到消息，供 _reset_history_view 重放时显示
             self.session.add_assistant(full)
             self.session.messages[-1]["_meta"] = self._last_stats
-        if self._pending_thinking:
+        if self._pending_thinking and has_output:
             thinking = "".join(self._pending_thinking).strip()
             if thinking:
                 # 思考内容存到当前（或上一条）assistant 消息的 _thinking 字段
                 self.session.messages[-1]["_thinking"] = thinking
         # 智能体模式：把本轮工具活动存进这条助手消息，重放时仍可展示
-        if self._pending_tools:
+        if self._pending_tools and has_output:
             self.session.messages[-1]["_tools"] = list(self._pending_tools)
         # 智能体模式：结构化步骤（子任务 → 各步骤 → 文本/工具）持久化到消息，供
         # _reset_history_view 分块渲染；有结构时正文以步骤视图展示，消息级
-        # thinking/tools 已并入步骤块、不再重复渲染。优先用流式期间就地构建的块
-        #（与直播渲染分块一致），无流式结构时回退到 result.agent_blocks。
-        blocks = self._finalize_agent_blocks() if self._structured else []
-        if result is not None and getattr(result, "agent_blocks", None):
-            blocks = blocks or list(result.agent_blocks)
-        if blocks:
+        # thinking/tools 已并入步骤块、不再重复渲染。
+        if blocks and has_output:
             self.session.messages[-1]["_agent_blocks"] = list(blocks)
         # 助手消息写透（含统计/思考/工具/结构化块 meta）；更新会话活跃时间与侧栏排序
-        if self.session.id is not None:
+        if self.session.id is not None and has_output:
             last = self.session.messages[-1]
             meta = {
                 k: last[k] for k in ("_meta", "_thinking", "_tools", "_agent_blocks")
@@ -2078,6 +2107,39 @@ class ChatPage(QWidget):
         self._cleanup_worker()
         self._reset_history_view()
         self._scroll_to_bottom()
+
+    def _fallback_full_text(self, blocks: list, result) -> str:
+        """正文累积为空时，从结构化块兜底拼出消息原文。
+
+        单子任务「纯工具收尾」（如带城市名的天气问题）的最终答案只落在
+        sub_block["answer"] → SUB_ANSWER token，不进 _pending_assistant，故 full 为空。
+        这里优先取 summary（多子任务的模型汇总），否则取各子任务 answer / 步骤 text；
+        任一非空即作为助手消息原文，保证有可读正文落盘、且 meta/思考/工具挂到正确的
+        助手消息上。
+
+        注意：不要用 result.content —— agent_bridge 仅剥离 THINK/TOOL 标记，
+        SUB_*/STEP_* 的 \x01…JSON 仍残留在其中，直接当正文会塞进控制字符垃圾。
+        """
+        # 有汇总块时以汇总为唯一正文（它才是面向用户的最终回答，避免把各子任务
+        # answer 也堆进原文视图）。
+        summaries = [(b.get("text") or "").strip()
+                     for b in (blocks or []) if b.get("kind") == "summary"]
+        summaries = [s for s in summaries if s]
+        if summaries:
+            return "\n\n".join(summaries).strip()
+        parts: list = []
+        for b in blocks or []:
+            if b.get("kind") == "summary":
+                continue
+            ans = (b.get("answer") or "").strip()
+            if ans:
+                parts.append(ans)
+                continue
+            for st in (b.get("steps") or []):
+                t = (st.get("text") or "").strip()
+                if t:
+                    parts.append(t)
+        return "\n\n".join(parts).strip()
 
     @Slot(str)
     def _on_failed(self, err: str):
@@ -2110,8 +2172,9 @@ class ChatPage(QWidget):
         self._root = []
         self._structured = False
         self._set_busy(False)
-        # 流式结束/停止：移除页面里的增量流式节点与光标，避免残留。
-        self._pending_stream_html = None
+        # 流式结束/停止：清掉脏标记与增量流式节点/光标，避免残留。
+        self._stream_dirty = False
+        self._flush_timer.stop()
         self._view_stop_streaming()
         if w is not None and w.isRunning():
             # 线程仍在运行（点了「停止/清空」）。不能直接丢引用——

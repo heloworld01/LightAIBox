@@ -278,6 +278,8 @@ class ProviderDialog(QDialog):
         )
         if self._provider is not None:
             p.id = self._provider.id
+            # 回调顺序等用户字段，避免编辑把 sort_order 重置为默认 0 而跳到列表最前
+            p.sort_order = self._provider.sort_order
             p.used_calls = self._provider.used_calls
             p.used_tokens = self._provider.used_tokens
             p.last_tokens_per_sec = self._provider.last_tokens_per_sec
@@ -544,35 +546,39 @@ class GatewayPage(QWidget):
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(12)
 
-        log_box = QFrame()
-        log_box.setProperty("class", "panel")
-        lf = QVBoxLayout(log_box)
-        lf.setContentsMargins(16, 16, 16, 16)
-        lf.setSpacing(12)
-        self.log_header = SectionHeader(self.tr("调用记录", "Call Logs"))
-        lf.addWidget(self.log_header)
+        # 调用记录不使用圆角面板，仅以一条横向分割线与上方 Provider 列表区分；
+        # 分割线置于「调用记录」标题上方，把左右两栏（Provider 列表 / 调用记录）隔开。
+        divider = QFrame()
+        divider.setProperty("class", "section-divider")
+        rv.addWidget(divider)
+        # 标题居左，日期 / Provider 筛选下沉到标题同一行的最右侧。
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+        self.log_title = QLabel(self.tr("调用记录", "Call Logs"))
+        self.log_title.setProperty("class", "section-title")
+        title_row.addWidget(self.log_title)
+        title_row.addStretch()
         # 过滤条：列表与统计均可按日期 / provider 过滤
-        fbar = QHBoxLayout()
         self.log_date_label = QLabel(self.tr("日期:", "Date:"))
-        fbar.addWidget(self.log_date_label)
+        title_row.addWidget(self.log_date_label)
         self.log_date_combo = QComboBox()
         self._rebuild_date_items()
         self.log_date_combo.setFixedWidth(130)
-        fbar.addWidget(self.log_date_combo)
+        title_row.addWidget(self.log_date_combo)
         self.log_provider_label = QLabel("Provider:")
-        fbar.addWidget(self.log_provider_label)
+        title_row.addWidget(self.log_provider_label)
         self.log_provider_combo = QComboBox()
         self.log_provider_combo.addItem(self.tr("全部", "All"), None)
         self.log_provider_combo.setFixedWidth(150)
-        fbar.addWidget(self.log_provider_combo)
-        fbar.addStretch()
-        lf.addLayout(fbar)
+        title_row.addWidget(self.log_provider_combo)
+        rv.addLayout(title_row)
         self.log_date_combo.currentIndexChanged.connect(self.refresh_logs)
         self.log_provider_combo.currentIndexChanged.connect(self.refresh_logs)
         # token 用量统计行（随日期 / provider 过滤联动）
         self.log_stats_label = QLabel()
         self.log_stats_label.setProperty("class", "stats-text")
-        lf.addWidget(self.log_stats_label)
+        rv.addWidget(self.log_stats_label)
         self.log_table = QTableWidget(0, 9)
         self.log_table.setHorizontalHeaderLabels(self._log_headers())
         hdr = self.log_table.horizontalHeader()
@@ -587,7 +593,7 @@ class GatewayPage(QWidget):
         hdr.setSectionResizeMode(8, QHeaderView.Fixed)     # 操作（删除按钮）
         self.log_table.setColumnWidth(8, 70)
         _setup_table_style(self.log_table)
-        lf.addWidget(self.log_table)
+        rv.addWidget(self.log_table)
 
         log_btns = QHBoxLayout()
         self.clear_logs_btn = QPushButton(self.tr("清空全部", "Clear All"))
@@ -595,9 +601,7 @@ class GatewayPage(QWidget):
         self.clear_logs_btn.clicked.connect(self._on_clear_logs)
         log_btns.addStretch()
         log_btns.addWidget(self.clear_logs_btn)
-        lf.addLayout(log_btns)
-
-        rv.addWidget(log_box)
+        rv.addLayout(log_btns)
 
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -658,7 +662,7 @@ class GatewayPage(QWidget):
         self.up_btn.setText(tr("↑ 上移", "↑ Up"))
         self.down_btn.setText(tr("↓ 下移", "↓ Down"))
         self.bar_btn.setText(tr("悬浮面板", "Floating bar"))
-        self.log_header.title_label.setText(tr("调用记录", "Call Logs"))
+        self.log_title.setText(tr("调用记录", "Call Logs"))
         self.log_date_label.setText(tr("日期:", "Date:"))
         self._rebuild_date_items()
         self.log_provider_combo.setItemText(0, tr("全部", "All"))

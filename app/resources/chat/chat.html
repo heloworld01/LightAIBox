@@ -248,21 +248,51 @@
   //   mermaidTheme  ：'default' / 'dark'
   //   showCursor    ：是否在末尾追加闪烁光标
   // 返回后自动按 _pinned 贴底（生成中仅在用户贴底时跟进）。
+  //
+  // 渲染串行队列：__appendStreaming 每次调用只把「最新待渲染 HTML」存进 _pending、
+  // 并在空闲时启动一趟渲染。这样即便 mermaid / MathJax 重排比 90~200ms 的 push 慢，
+  // 也始终只有一条渲染链在跑；渲染期间的多次 push 只覆盖内容、不排队堆积，从根上
+  // 避免慢渲染在微任务积压里堆成「迟到的批量重排」抖动（还能合并掉中间态，天然丢中间帧）。
+  window._streamRunning = false;
+  window._streamPending = null;
   window.__appendStreaming = function (html, mermaidTheme, showCursor) {
+    window._streamPending = { html: html, theme: mermaidTheme, cursor: showCursor };
+    if (!window._streamRunning) { _streamRun(); }
+  };
+
+  function _streamDrainAndRender(p) {
     var el = _streamEnsure();
-    el.innerHTML = html + (showCursor === false ? '' : '<span class="stream-cursor"></span>');
-    window.__mermaidReady
-      .then(function () { return _runMermaidIn(el, mermaidTheme); })
-      .then(function () { return window.__mathJaxReady; })
+    el.innerHTML = p.html + (p.cursor === false ? '' : '<span class="stream-cursor"></span>');
+    // MathJax.typesetClear([el]) 先清掉本节点上一次已排版的标记（mjx-container /
+    // 内部缓存标记），再对整节点重新排版——否则增量替换后旧的中间态公式排版会被
+    // 重复处理，长公式消息在多次刷新下越滚越慢。
+    return _runMermaidIn(el, p.theme)
+      .then(function () { return MathJax.typesetClear([el]); })
       .then(function () { return MathJax.typesetPromise([el]); })
       .then(function () {
         if (_pinned) _scrollBottom();
       })
-      .catch(function () { if (_pinned) _scrollBottom(); });
-  };
+      .catch(function (e) { console.warn('stream render', e); });
+  }
 
-  // 结束流式：移除流式节点并复位贴底标志（随后 Python 会以全量 __renderChat 固化整段历史）。
+  function _streamRun() {
+    if (window._streamRunning) { return; }
+    window._streamRunning = true;
+    var p = window._streamPending;
+    window._streamPending = null;
+    if (!p) { window._streamRunning = false; return; }
+    _streamDrainAndRender(p).then(function () {
+      window._streamRunning = false;
+      // 渲染期间又有新 push：立即续跑最新内容（此时无其它渲染在跑，无需再节流）。
+      if (window._streamPending) { _streamRun(); }
+    });
+  }
+
+  // 结束流式：清掉待渲染队列、移除流式节点并复位贴底标志（随后 Python 会以全量
+  // __renderChat 固化整段历史）。清 _streamPending 可防止 in-flight 渲染链在结束后
+  // 又把残留的中间态气泡 re-create 出来。
   window.__streamStop = function () {
+    window._streamPending = null;
     var el = _streamEl();
     if (el && el.parentNode) el.parentNode.removeChild(el);
   };
