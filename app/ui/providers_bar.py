@@ -91,6 +91,28 @@ def _hide_window_from_taskbar(widget) -> bool:
         return False  # 非 Windows / 权限受限时静默跳过
 
 
+def _assert_topmost(widget) -> None:
+    """用原生 SetWindowPos 把窗口重申到 topmost 带最前。
+
+    Qt 的 WindowStaysOnTopHint 在 Windows 上是「一次性」置顶：当另一个带
+    topmost 属性的应用被激活，z-order 会把它压下去；而锁定（WS_EX_TRANSPARENT
+    点击穿透）后面板再也收不到交互事件，无法靠 raise_/拖动自行回顶，于是出现
+    「锁定后仍有应用盖在上面」。这里绕过 Qt、直接走 Win32，周期性把面板顶回
+    topmost 带首位即可恢复且不被覆盖。非 Windows 静默跳过。
+    """
+    try:
+        hwnd = int(widget.winId())
+        HWND_TOPMOST = -1
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010   # 不抢焦点：置顶但不激活、不打断用户当前操作
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    except Exception:
+        pass
+
+
 class _ProviderCell(QWidget):
     """一个 provider 的竖排整行色块。
 
@@ -104,6 +126,11 @@ class _ProviderCell(QWidget):
         self._p = provider
         self.setFixedHeight(CELL_H)
         self.setToolTip(self._tooltip())
+        # 全局 QSS 给 QWidget 设了不透明背景 #0E1117，会在此绘成整块方角，
+        # 盖在父面板半透明圆角下形成「阴影方角」。去掉透明背景自动填充，
+        # 只由 paintEvent 自绘半透明圆角色块。
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
 
     def _name_font(self) -> QFont:
         f = QFont()
@@ -204,6 +231,9 @@ class _TextButton(QWidget):
         self._hover = False
         self.setFixedSize(width, BTN_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 同上：避免全局 QSS 给 QWidget 的不透明背景在按钮上绘成方角阴影。
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
 
     def setTextGetter(self, getter) -> None:
         self._text_getter = getter
@@ -404,6 +434,10 @@ class ProvidersBar(QWidget):
     # 数据刷新
     # ------------------------------------------------------------------ #
     def _refresh(self):
+        # 锁定态：每拍重申置顶（面板穿透后收不到交互，无法靠用户操作回顶；
+        # 不放在数据签名判断之后，否则用量不变时会提前 return 而漏掉兜底）。
+        if self._locked and self.isVisible():
+            self._assert_topmost()
         running = [p for p in self._gateway.providers.list() if p.is_available()]
         sig = tuple((p.id, p.used_calls, p.used_tokens, p.quota_type,
                      p.quota_limit) for p in running)
@@ -465,6 +499,14 @@ class ProvidersBar(QWidget):
                     hwnd, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT)
         except Exception:
             pass  # 非 Windows / 权限受限时静默跳过（退化为仅禁止拖动）
+        # 锁定后穿透使面板收不到交互、无法自行回顶：立即重申一次置顶，
+        # 并由 _refresh 周期兜底（见下）。解锁同样补一次，确保回到最前。
+        self._assert_topmost()
+
+    def _assert_topmost(self) -> None:
+        """把主面板与按钮小窗一起重申到 topmost 带最前（详见模块级 helper）。"""
+        _assert_topmost(self)
+        _assert_topmost(self._controller)
 
     # ------------------------------------------------------------------ #
     # 定位 / 拖动
